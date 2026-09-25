@@ -1,0 +1,45 @@
+# Python environment
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.ipynb_checkpoints/
+
+# Large competition datasets (>1 GB / >2.4 GB uncompressed)
+# Dataset can be accessed via Google Drive:
+# https://drive.google.com/drive/folders/1pNh7H29uPlFTPMu6MpHEhcSVW1o7j6Qi?usp=sharing
+dataset/
+student_resource/dataset/
+**/dataset/
+*.tsv
+*.csv
+*.zip
+*.tar.gz
+*.7z
+
+# Video and large media assets
+*.mp4
+
+# Model weights and artifacts
+models/
+*.pth
+*.pt
+*.bin
+*.onnx
+*.safetensors
+
+# Submission outputs (generated locally)
+output/
+**/output/
+
+# Operating system and editor artifacts
+.DS_Store
+__MACOSX/
+Thumbs.db
+ehthumbs.db
+.idea/
+.vscode/
