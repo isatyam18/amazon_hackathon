@@ -185,7 +185,6 @@ def preprocess_record(record: Dict[str, str]) -> Dict[str, any]:
     clean_name, core_name, suffix = clean_business_name(raw_name)
     cleaned_addr = clean_address(raw_addr)
     postal_code = extract_postal_code(raw_addr, country)
-    numeric_tokens = extract_numeric_tokens(cleaned_addr)
 
     return {
         "entity_id": entity_id,
@@ -194,6 +193,18 @@ def preprocess_record(record: Dict[str, str]) -> Dict[str, any]:
         "legal_suffix": suffix,
         "clean_address": cleaned_addr,
         "country": country,
-        "postal_code": postal_code,
-        "numeric_tokens": numeric_tokens,
+        "postal_code": postal_code or "",
     }
+
+
+def preprocess_dataframe(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Preprocess an entire pandas DataFrame chunk efficiently.
+
+    Expects columns: ['entity_id', 'business_name', 'business_address', 'country']
+    Returns DataFrame with normalized columns.
+    """
+    records = df.to_dict("records")
+    processed = [preprocess_record(r) for r in records]
+    import pandas as pd
+    return pd.DataFrame(processed)
+
