@@ -24,9 +24,11 @@ def generate_matching_results(
     Every query in all_query_ids has exactly one row.
     If no candidate passes the threshold, matched_entity_ids is empty.
     """
+    q_col = "source1_entity_id" if "source1_entity_id" in candidates_df.columns else "query_id"
+    c_col = "candidate_entity_id" if "candidate_entity_id" in candidates_df.columns else "candidate_id"
     df = pd.DataFrame({
-        "query_id": candidates_df["query_id"].values,
-        "candidate_id": candidates_df["candidate_id"].values,
+        "query_id": candidates_df[q_col].values,
+        "candidate_id": candidates_df[c_col].values,
         "prob": probabilities,
     })
 

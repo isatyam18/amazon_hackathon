@@ -108,8 +108,8 @@ def extract_pair_features(
     """Extract full feature set combining Stage 2 scores + fine-grained metrics.
 
     Args:
-        candidates_df: DataFrame with columns:
-            ['query_id', 'candidate_id', 'candidate_score', 'source_rank', ...]
+        candidates_df: DataFrame with candidate pairs. Supports either
+            ['source1_entity_id', 'candidate_entity_id'] or ['query_id', 'candidate_id'].
         preprocessed_records: mapping from entity_id -> preprocessed dict
             containing 'clean_name', 'core_name', 'clean_address', 'postal_code'
 
@@ -117,8 +117,11 @@ def extract_pair_features(
         DataFrame of feature rows matching candidate rows.
     """
     rows = []
-    q_ids = candidates_df["query_id"].values
-    c_ids = candidates_df["candidate_id"].values
+    q_col = "source1_entity_id" if "source1_entity_id" in candidates_df.columns else "query_id"
+    c_col = "candidate_entity_id" if "candidate_entity_id" in candidates_df.columns else "candidate_id"
+
+    q_ids = candidates_df[q_col].values
+    c_ids = candidates_df[c_col].values
 
     for i in range(len(candidates_df)):
         qid = q_ids[i]
@@ -141,32 +144,20 @@ def extract_pair_features(
 
     feat_df = pd.DataFrame(rows)
 
-    # Bring over Stage 2 precomputed features if available
-    stage2_cols = [
-        "candidate_score",
-        "source_rank",
-        "score_name",
-        "score_addr",
-        "score_name_addr",
-        "sim_name_char3",
-        "sim_name_pkey3",
-        "sim_addr_word",
-        "sim_addr_bigram",
-        "sim_name_addr",
-    ]
-    for col in stage2_cols:
+    # Bring over all Stage 2 precomputed features if available
+    stage2_cols = [c for c in candidates_df.columns if c.startswith("score_") or c.startswith("sim_")]
+    stage2_cols.extend(["candidate_score", "source_rank"])
+    for col in set(stage2_cols):
         if col in candidates_df.columns:
-            feat_df[col] = candidates_df[col].values
+            feat_df[col] = candidates_df[col].astype(float).values
         else:
             feat_df[col] = 0.0
 
     # Source indicator (S2 vs S3)
     if "source" in candidates_df.columns:
         feat_df["is_s2"] = (candidates_df["source"] == "S2").astype(float).values
-    elif "candidate_id" in candidates_df.columns:
-        feat_df["is_s2"] = candidates_df["candidate_id"].str.startswith("S2-").astype(float).values
     else:
-        feat_df["is_s2"] = 0.0
+        feat_df["is_s2"] = pd.Series(c_ids).str.startswith("S2-").astype(float).values
 
     return feat_df
 

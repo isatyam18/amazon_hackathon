@@ -34,26 +34,35 @@ from src.matching.pipeline import generate_matching_results, write_submission
 
 
 def load_preprocessed_lookup(preprocessed_dir: str, split: str = "train") -> dict:
-    """Load preprocessed source files and build fast lookup mapping: entity_id -> dict."""
+    """Load preprocessed source files and build fast lookup mapping: entity_id -> dict.
+    Supports both .parquet and .tsv formats seamlessly.
+    """
     print(f"Loading preprocessed lookup records for {split}...")
     lookup = {}
     sources = [1, 2, 3]
     for s in sources:
+        parquet_path = os.path.join(preprocessed_dir, f"{split}_source{s}.parquet")
         tsv_path = os.path.join(preprocessed_dir, f"{split}_source{s}.tsv")
-        if os.path.exists(tsv_path):
+        df = None
+        if os.path.exists(parquet_path):
+            df = pd.read_parquet(parquet_path)
+            print(f"  Loaded {split}_source{s}.parquet: {len(df):,} records")
+        elif os.path.exists(tsv_path):
             df = pd.read_csv(tsv_path, sep="\t", dtype=str)
-            for _, r in df.iterrows():
-                eid = r.get("entity_id")
-                if eid:
-                    lookup[eid] = {
-                        "clean_name": r.get("clean_name", ""),
-                        "core_name": r.get("core_name", ""),
-                        "clean_address": r.get("clean_address", ""),
-                        "postal_code": r.get("postal_code", ""),
-                    }
-            print(f"  Loaded {split}_source{s}: {len(df):,} records")
+            print(f"  Loaded {split}_source{s}.tsv: {len(df):,} records")
         else:
-            print(f"  Warning: {tsv_path} not found.")
+            print(f"  Warning: Neither {parquet_path} nor {tsv_path} found.")
+            continue
+
+        for _, r in df.iterrows():
+            eid = r.get("entity_id")
+            if eid:
+                lookup[eid] = {
+                    "clean_name": str(r.get("clean_name", "") or ""),
+                    "core_name": str(r.get("core_name", "") or r.get("clean_name", "") or ""),
+                    "clean_address": str(r.get("clean_address", "") or ""),
+                    "postal_code": str(r.get("postal_code", "") or ""),
+                }
     return lookup
 
 
@@ -79,9 +88,12 @@ def run_train_and_tune(args):
         m_str = str(r["matched_entity_ids"]) if pd.notna(r["matched_entity_ids"]) else ""
         gt_map[qid] = {m.strip() for m in m_str.split(",") if m.strip()}
 
+    q_col = "source1_entity_id" if "source1_entity_id" in train_candidates.columns else "query_id"
+    c_col = "candidate_entity_id" if "candidate_entity_id" in train_candidates.columns else "candidate_id"
+    q_ids = train_candidates[q_col].values
+    c_ids = train_candidates[c_col].values
+
     labels = []
-    q_ids = train_candidates["query_id"].values
-    c_ids = train_candidates["candidate_id"].values
     for qid, cid in zip(q_ids, c_ids):
         labels.append(1 if cid in gt_map.get(qid, set()) else 0)
     y_train = np.array(labels, dtype=int)
@@ -106,8 +118,10 @@ def run_train_and_tune(args):
             m_str = str(r["matched_entity_ids"]) if pd.notna(r["matched_entity_ids"]) else ""
             val_gt_map[qid] = {m.strip() for m in m_str.split(",") if m.strip()}
 
+        vq_col = "source1_entity_id" if "source1_entity_id" in val_candidates.columns else "query_id"
+        vc_col = "candidate_entity_id" if "candidate_entity_id" in val_candidates.columns else "candidate_id"
         val_labels = [1 if cid in val_gt_map.get(qid, set()) else 0
-                      for qid, cid in zip(val_candidates["query_id"], val_candidates["candidate_id"])]
+                      for qid, cid in zip(val_candidates[vq_col], val_candidates[vc_col])]
         y_val = np.array(val_labels, dtype=int)
         X_val = extract_pair_features(val_candidates, train_lookup)
 
@@ -122,6 +136,7 @@ def run_train_and_tune(args):
     )
 
     # Save model
+    os.makedirs(os.path.dirname(args.model_path) or ".", exist_ok=True)
     model.save(args.model_path)
     print(f"Model saved to: {args.model_path}")
 
@@ -146,8 +161,12 @@ def run_train_and_tune(args):
             "best_macro_f05": best_score,
             "threshold_curve": score_curve,
         }
-        with open("dataset/candidates/threshold_tuning_report.json", "w") as f:
+        report_dir = os.path.dirname(args.val_candidates) or "dataset/candidates"
+        report_path = os.path.join(report_dir, "threshold_tuning_report.json")
+        os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        with open(report_path, "w") as f:
             json.dump(report, f, indent=2)
+        print(f"Tuning report saved to: {report_path}")
 
     return model, optimal_threshold
 
@@ -166,10 +185,19 @@ def run_test_inference(args, model, threshold):
     print(f"Total test candidate pairs to score: {len(test_candidates):,}")
 
     # 3. Load all test query IDs (every S1 query must appear in submission!)
-    test_s1_path = os.path.join(args.preprocessed_dir, "test_source1.tsv")
-    if not os.path.exists(test_s1_path):
-        test_s1_path = "student_resource/dataset/test/test_source1.tsv"
-    test_s1_df = pd.read_csv(test_s1_path, sep="\t", usecols=["entity_id"])
+    test_s1_parquet = os.path.join(args.preprocessed_dir, "test_source1.parquet")
+    test_s1_tsv = os.path.join(args.preprocessed_dir, "test_source1.tsv")
+    test_s1_raw = "student_resource/dataset/test/test_source1.tsv"
+
+    if os.path.exists(test_s1_parquet):
+        test_s1_df = pd.read_parquet(test_s1_parquet, columns=["entity_id"])
+    elif os.path.exists(test_s1_tsv):
+        test_s1_df = pd.read_csv(test_s1_tsv, sep="\t", usecols=["entity_id"])
+    elif os.path.exists(test_s1_raw):
+        test_s1_df = pd.read_csv(test_s1_raw, sep="\t", usecols=["entity_id"])
+    else:
+        sys.exit("Error: Could not locate test_source1 to get all query IDs.")
+
     all_query_ids = list(test_s1_df["entity_id"])
     print(f"Total test Source 1 queries: {len(all_query_ids):,}")
 
@@ -195,11 +223,16 @@ def run_test_inference(args, model, threshold):
 
     # 6. Validate with official challenge validator
     validator_path = "student_resource/utils/validate_submission.py"
+    if not os.path.exists(validator_path):
+        validator_path = os.path.join(os.path.dirname(__file__), "..", "student_resource", "utils", "validate_submission.py")
+
     if os.path.exists(validator_path):
         print("\nValidating submission against official competition rules...")
         test_dir = "student_resource/dataset/test"
+        if not os.path.exists(test_dir):
+            test_dir = os.path.join(os.path.dirname(__file__), "..", "student_resource", "dataset", "test")
         cand_arg = f"--candidate {args.test_candidate_tsv}" if os.path.exists(args.test_candidate_tsv) else ""
-        cmd = f"python {validator_path} --matching {args.out_file} {cand_arg} --test-dir {test_dir}"
+        cmd = f'python "{validator_path}" --matching "{args.out_file}" {cand_arg} --test-dir "{test_dir}"'
         ret = os.system(cmd)
         if ret == 0:
             print("\nSUCCESS: Submission passed all validation checks!")

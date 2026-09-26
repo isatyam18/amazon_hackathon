@@ -88,9 +88,11 @@ def find_optimal_threshold(
         best_score: float
         scores_by_threshold: dict mapping threshold -> macro_f05
     """
+    q_col = "source1_entity_id" if "source1_entity_id" in candidates_df.columns else "query_id"
+    c_col = "candidate_entity_id" if "candidate_entity_id" in candidates_df.columns else "candidate_id"
     df = pd.DataFrame({
-        "query_id": candidates_df["query_id"].values,
-        "candidate_id": candidates_df["candidate_id"].values,
+        "query_id": candidates_df[q_col].values,
+        "candidate_id": candidates_df[c_col].values,
         "prob": probabilities,
     })
 
