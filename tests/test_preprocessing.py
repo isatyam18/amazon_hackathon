@@ -4,7 +4,7 @@ import sys
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.preprocessing import clean_business_name, clean_address, extract_postal_code, preprocess_record
+from src.preprocessing import clean_business_name, clean_address, extract_numeric_tokens, extract_postal_code, preprocess_record
 
 def run_tests():
     test_cases = [
@@ -36,7 +36,7 @@ def run_tests():
         print("  Suffix     :", res["legal_suffix"])
         print("  Clean addr :", res["clean_address"])
         print("  Postal code:", res["postal_code"])
-        print("  Numerics   :", res["numeric_tokens"])
+        print("  Numerics   :", extract_numeric_tokens(res["clean_address"]))
         print("-" * 50)
 
 if __name__ == "__main__":

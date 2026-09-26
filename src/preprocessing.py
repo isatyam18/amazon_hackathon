@@ -2,6 +2,7 @@
 Data Preprocessing and Normalization Module for Business Entity Resolution.
 
 Handles:
+- Indic script transliteration (Devanagari, Tamil, Telugu, ... -> Latin; see transliteration.py)
 - Unicode normalization and de-accenting (for multilingual data: US, India, France)
 - Business name cleaning and legal suffix stripping (US, Indian, and French legal forms)
 - Address standardization (abbreviations, directional cues, landmark normalization)
@@ -11,6 +12,8 @@ Handles:
 import re
 import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
+
+from src.transliteration import transliterate_indic
 
 
 # Regex for Unicode accents removal
@@ -93,9 +96,12 @@ ADDRESS_PATTERNS = [
 
 
 def clean_text(text: Optional[str]) -> str:
-    """Base cleaner: de-accent, lowercase, collapse dot acronyms, standardize symbols, strip extra whitespace."""
+    """Base cleaner: transliterate Indic scripts, de-accent, lowercase, collapse dot acronyms,
+    standardize symbols, strip extra whitespace."""
     if not text or not isinstance(text, str):
         return ""
+    # Must run before remove_accents: NFKD + combining-mark removal would strip viramas/nuktas
+    text = transliterate_indic(text)
     text = remove_accents(text).lower()
     # Collapse dotted abbreviations like s.a.r.l. -> sarl, l.l.c. -> llc
     text = re.sub(r"(?<=\b[a-z])\.(?=[a-z]\b)", "", text)
