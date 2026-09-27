@@ -189,6 +189,7 @@ class Partition:
                 if mask.any():
                     out[idx[mask]] = np.mean([m.predict_proba(X[mask]) for m in models], axis=0)
             del X
+            release_memory()
             log(f"[matching]   {self.graph.country}: scored {idx[-1] + 1:,}/{n:,} pairs ({time.time() - t0:.0f}s)")
         return out
 
@@ -460,6 +461,7 @@ def predict_and_write(
     require exactly one row per S1 entity. S1 entities without any candidate get
     an empty row in both files.
     """
+    log(f"[matching] loading universe for {split}...")
     universe = Universe.load(preprocessed_dir, split)
     written = np.zeros(len(universe), bool)
     stats = {}
@@ -469,19 +471,86 @@ def predict_and_write(
             open(candidate_path, "w", encoding="utf-8", newline="\n") as fc:
         fm.write("source1_entity_id\tmatched_entity_ids\n")
         fc.write("source1_entity_id\tcandidate_entity_ids\n")
-        for country in candidate_countries(candidates_path):
-            graph = CandidateGraph.load(candidates_path, universe, country)
-            part = Partition.build(graph, preprocessed_dir, split, n_jobs)
-            prob = part.score(lambda idx: [(np.ones(len(idx), bool), models)], log=log)
-            if stack_models:
-                from src.matching.stacking import apply_stack
+        countries = candidate_countries(candidates_path)
+        log(f"[matching] test partitions to process: {countries}")
+        for country in countries:
+            ckpt_dir = os.path.join(os.path.dirname(matching_path), ".checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, f"raw_prob_{country}.npy")
 
-                prob = apply_stack(stack_models, graph.q, graph.t, prob)
+            log(f"[matching] {country}: loading candidate graph from {candidates_path}...")
+            graph = CandidateGraph.load(candidates_path, universe, country)
+            log(f"[matching] {country}: loaded {len(graph):,} candidate pairs. Building partition records...")
+            part = Partition.build(graph, preprocessed_dir, split, n_jobs)
+            log(f"[matching] {country}: partition records ready.")
+
+            if os.path.exists(ckpt_path):
+                log(f"[matching] Found existing checkpoint for {country}: loading {ckpt_path}")
+                prob = np.load(ckpt_path)
+            else:
+                log(f"[matching] {country}: scoring {len(graph):,} candidate pairs in chunks...")
+                prob = part.score(lambda idx: [(np.ones(len(idx), bool), models)], log=log)
+                if stack_models:
+                    from src.matching.stacking import apply_stack
+
+                    prob = apply_stack(stack_models, graph.q, graph.t, prob)
+                np.save(ckpt_path, prob)
+                log(f"[matching] Saved checkpoint for {country} to {ckpt_path}")
+
             prob = calibrator.transform(prob)
+
+            # High-Precision Guardrail 1: House Number Conflict Veto
+            store_houses = part.store.house.arr.to_numpy(zero_copy_only=False)
+            u_houses, house_codes = np.unique(store_houses, return_inverse=True)
+            empty_house_arr = np.where(u_houses == "")[0]
+            if len(empty_house_arr) > 0:
+                empty_house = empty_house_arr[0]
+                qh_c = house_codes[part.q_local]
+                th_c = house_codes[part.t_local]
+                both_house = (qh_c != empty_house) & (th_c != empty_house)
+                diff_house = both_house & (qh_c != th_c)
+                if diff_house.any():
+                    diff_idx = np.flatnonzero(diff_house)
+                    qh_diff = u_houses[qh_c[diff_idx]]
+                    th_diff = u_houses[th_c[diff_idx]]
+                    prefix_match = np.array([a.startswith(b) or b.startswith(a) for a, b in zip(qh_diff, th_diff)])
+                    strict_conflict_idx = diff_idx[~prefix_match]
+                    if len(strict_conflict_idx) > 0:
+                        addr_sim = graph.blocking.get("sim_addr_word")
+                        if addr_sim is not None:
+                            veto_mask = addr_sim[strict_conflict_idx] < 0.85
+                            veto_idx = strict_conflict_idx[veto_mask]
+                        else:
+                            veto_idx = strict_conflict_idx
+                        if len(veto_idx) > 0:
+                            prob[veto_idx] = np.minimum(prob[veto_idx], 0.05)
+                            log(f"[matching]   {country}: vetoed {len(veto_idx):,} conflicting house number pairs")
+            del store_houses, u_houses, house_codes
+
+            # High-Precision Guardrail 2: French Département Consistency Filter
+            if str(country).strip().lower() == "france":
+                import re
+                dept_pat = re.compile(r"\b(0[1-9]|[1-8]\d|9[0-8])\d{3}\b")
+                store_addrs = part.store.addr.arr.to_numpy(zero_copy_only=False)
+                store_depts = np.array([m.group(1) if (m := dept_pat.search(a)) else "" for a in store_addrs], dtype=object)
+                u_depts, dept_codes = np.unique(store_depts, return_inverse=True)
+                empty_dept_arr = np.where(u_depts == "")[0]
+                if len(empty_dept_arr) > 0:
+                    empty_dept = empty_dept_arr[0]
+                    qd_c = dept_codes[part.q_local]
+                    td_c = dept_codes[part.t_local]
+                    dept_mismatch = (qd_c != empty_dept) & (td_c != empty_dept) & (qd_c != td_c)
+                    if dept_mismatch.any():
+                        prob[dept_mismatch] = 0.0
+                        log(f"[matching]   France: vetoed {int(dept_mismatch.sum()):,} cross-département pairs")
+                del store_addrs, store_depts, u_depts, dept_codes
+
             selected = apply_rule(rule, graph.q, graph.t, prob)
             rows = np.unique(graph.q)
             write_rows(fm, universe.s1_ids, rows, graph.q[selected], graph.t_ids[graph.t[selected]], prob[selected])
             write_rows(fc, universe.s1_ids, rows, graph.q, graph.t_ids[graph.t], prob)
+            fm.flush()
+            fc.flush()
             written[rows] = True
             n_pred = np.bincount(graph.q[selected], minlength=len(universe))[rows]
             stats[country] = {"s1": int(len(rows)), "pairs": int(len(graph)),

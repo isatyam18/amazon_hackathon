@@ -49,3 +49,5 @@ Thumbs.db
 ehthumbs.db
 .idea/
 .vscode/
+*.log
+*.err

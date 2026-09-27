@@ -229,7 +229,7 @@ def main():
     parser.add_argument("--train-queries", type=int, default=120_000,
                         help="S1 entities sampled per fold for training")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n-jobs", type=int, default=2, help="worker processes for record normalisation")
+    parser.add_argument("--n-jobs", type=int, default=1, help="worker processes for record normalisation")
     parser.add_argument("--check-ids", action="store_true", help="validator: also check that every id exists")
     parser.add_argument("--s3-bucket", default=None, help="optional S3 bucket for a backup of the submission")
     args = parser.parse_args()

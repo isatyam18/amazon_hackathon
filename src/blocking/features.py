@@ -151,11 +151,15 @@ def featurize(
     if n_jobs == 1 or len(bounds) == 1:
         parts = [_hash_chunk(names[a:b], addresses[a:b], views, hash_bits, ngram) for a, b in bounds]
     else:
-        from joblib import Parallel, delayed
+        try:
+            from joblib import Parallel, delayed
 
-        parts = Parallel(n_jobs=n_jobs)(
-            delayed(_hash_chunk)(names[a:b], addresses[a:b], views, hash_bits, ngram) for a, b in bounds
-        )
+            with Parallel(n_jobs=n_jobs) as parallel:
+                parts = parallel(
+                    delayed(_hash_chunk)(names[a:b], addresses[a:b], views, hash_bits, ngram) for a, b in bounds
+                )
+        except Exception:
+            parts = [_hash_chunk(names[a:b], addresses[a:b], views, hash_bits, ngram) for a, b in bounds]
     out = {}
     for v in views:  # stack view by view, releasing each chunk as soon as it is consumed
         out[v] = sp.vstack([p.pop(v) for p in parts], format="csr")

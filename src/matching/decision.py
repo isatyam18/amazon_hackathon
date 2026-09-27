@@ -63,10 +63,11 @@ class Calibrator:
 class DecisionRule:
     method: str = "expected_f"      # "expected_f" or "threshold"
     threshold: float = 0.5          # threshold method: minimum probability
-    missing_mass: float = 0.05      # expected_f: expected true matches per query missed by blocking
+    missing_mass: float = 0.035     # expected_f: expected true matches per query missed by blocking
     owner_normalize: bool = True    # divide by the record's total probability across S1 entities
     exclusive: bool = True          # a record keeps at most one S1 entity
     beta: float = 0.5
+    min_singleton_prob: float = 0.60  # require at least one candidate with p >= 0.60 to break singleton
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -82,7 +83,7 @@ def select_threshold(query: np.ndarray, p: np.ndarray, threshold: float) -> np.n
 
 
 def select_expected_f(query: np.ndarray, p: np.ndarray, beta: float = 0.5, missing_mass: float = 0.0,
-                      sorted_by_query=None) -> np.ndarray:
+                      sorted_by_query=None, min_singleton_prob: float = 0.60) -> np.ndarray:
     """Boolean mask of the expected-F_beta-optimal candidate set of every query.
 
     `sorted_by_query` may pass a precomputed `rank_within_groups(query, p)` result
@@ -114,7 +115,8 @@ def select_expected_f(query: np.ndarray, p: np.ndarray, beta: float = 0.5, missi
     is_best = expected >= best[group] - 1e-12
     big = np.iinfo(np.int64).max
     best_rank = np.minimum.reduceat(np.where(is_best, rank, big), starts)  # first rank reaching the best
-    keep_group = best > empty_score
+    top_p = np.maximum.reduceat(p_s, starts)  # highest candidate probability for the query (shape: len(starts))
+    keep_group = (best > empty_score) & (top_p >= min_singleton_prob)
     chosen = keep_group[group] & (rank <= best_rank[group])
 
     mask = np.zeros(n, bool)
@@ -151,7 +153,9 @@ def apply_rule(rule: DecisionRule, query: np.ndarray, target: np.ndarray, p: np.
         skey = ("sorted", rule.owner_normalize)
         if skey not in cache:
             cache[skey] = rank_within_groups(query, q)
-        selected = select_expected_f(query, q, rule.beta, rule.missing_mass, sorted_by_query=cache[skey])
+        min_p = getattr(rule, "min_singleton_prob", 0.60)
+        selected = select_expected_f(query, q, rule.beta, rule.missing_mass,
+                                     sorted_by_query=cache[skey], min_singleton_prob=min_p)
     else:
         raise ValueError(f"Unknown decision method {rule.method!r}")
     return enforce_exclusivity(target, q, selected) if rule.exclusive else selected

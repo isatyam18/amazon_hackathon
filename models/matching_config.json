@@ -1046,10 +1046,11 @@
   "decision_rule": {
     "method": "expected_f",
     "threshold": 0.5,
-    "missing_mass": 0.0,
+    "missing_mass": 0.035,
     "owner_normalize": true,
     "exclusive": true,
-    "beta": 0.5
+    "beta": 0.5,
+    "min_singleton_prob": 0.60
   },
   "rule_grid": [
     {

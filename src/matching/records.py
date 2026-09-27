@@ -70,9 +70,13 @@ class RecordStore:
         addrs = frame["clean_address"].to_numpy(object).tolist()
         bounds = [(i, min(i + chunk_size, len(names))) for i in range(0, len(names), chunk_size)]
         if n_jobs > 1 and len(bounds) > 1:
-            from joblib import Parallel, delayed
+            try:
+                from joblib import Parallel, delayed
 
-            parts = Parallel(n_jobs=n_jobs)(delayed(_derive_chunk)(names[a:b], addrs[a:b]) for a, b in bounds)
+                with Parallel(n_jobs=n_jobs) as parallel:
+                    parts = parallel(delayed(_derive_chunk)(names[a:b], addrs[a:b]) for a, b in bounds)
+            except Exception:
+                parts = [_derive_chunk(names[a:b], addrs[a:b]) for a, b in bounds]
         else:
             parts = [_derive_chunk(names[a:b], addrs[a:b]) for a, b in bounds]
         for key in STRING_FIELDS:
