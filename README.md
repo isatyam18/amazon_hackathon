@@ -129,7 +129,8 @@ No feature uses the country label, so the matcher applies unchanged to France (a
 
 ### Stage 4: Matcher, Calibration and Honest Evaluation — `model.py`, `decision.py`, `workflow.py`
 - **Universe**: all 2.2M train S1 entities with their Stage 2 candidates from the full train S2/S3 (66.2M pairs). Candidate lists and the competition between S1 entities for each record look as they will on test.
-- **LightGBM** (binary log-loss, 63 leaves, bagging, early stopping on a held-out 10% of the *training* queries). **Two query folds** (hash of the S1 id): a model trained on 120k fold-0 entities scores fold 1 and vice versa, so every pair gets an out-of-fold probability.
+- **LightGBM** (binary log-loss, 63 leaves, learning rate 0.05, bagging, up to 1,000 rounds with early stopping on a held-out 10% of the *training* queries). **Two query folds** (hash of the S1 id): a model trained on 120k fold-0 entities scores fold 1 and vice versa, so every pair gets an out-of-fold probability.
+- **Second stage (stacking, `src/matching/stacking.py`)**: a small LightGBM (31 leaves) on first-stage probabilities in context. Features: the probability and its logit; for the S1 entity, its margin over the best other candidate, its rank, the sum of its candidates' probabilities and how many exceed 0.5; for the S2/S3 record, its margin over the best *competing* S1, its rank among them, the sum of their probabilities and their number. It is trained with the same two query folds on out-of-fold first-stage probabilities, so its own predictions are out-of-fold too. It was adopted because it beat the first stage on fold 0.
 - **Calibration** (isotonic) **and the decision rule are fitted on fold 0 only.** Fold 1 is used for nothing but the reported score.
 - **Exact metric** (`threshold.py`): per-S1 F0.5 = 1.25·P·R/(0.25·P+R), averaged over *all* S1 entities. Singletons score 1.0 only when predicted empty, and true matches missed by blocking count against recall. Unit-tested against the reference implementation and the problem-statement example.
 - **Memory**: everything streams one country partition at a time. No pair, record or constraint crosses countries, so this is exact. Peak memory is about 5 GB.
@@ -139,9 +140,34 @@ No feature uses the country label, so the matcher applies unchanged to France (a
 - **Expected-F0.5 set selection**: per S1 entity, keep the top-k candidates that maximise the expected F0.5, using F_β = (1+β²)·TP/(|S|+β²·|T|). Predict nothing when "no match" is the better bet. This handles multi-match entities and singletons with one principled rule instead of a global threshold.
 - **Exclusivity**: a record predicted for several S1 entities stays with the most probable one.
 - The rule variant (and a global-threshold baseline) is chosen on fold 0.
-- **Test**: both fold models are averaged, calibrated, and the rule is applied. `output/matching_results.tsv` and `output/candidate_pairs.tsv` (exactly the scored pairs) are written, and the official validator is run.
+- **Test**: the two first-stage fold models are averaged, the two second-stage models are applied to those probabilities in context and averaged, the result is calibrated, and the rule is applied. `output/matching_results.tsv` and `output/candidate_pairs.tsv` (exactly the scored pairs) are written, and the official validator is run.
 
-__STAGE345_RESULTS__
+### Results (submitted model)
+
+Local scores use the exact leaderboard metric on **fold 1**: 1.1M train S1 entities whose labels were not used to train the models that scored them, to fit the calibrator, or to choose the decision rule.
+
+| | Macro F0.5 | Pair precision | Pair recall | Singletons left empty | US | India |
+|---|---|---|---|---|---|---|
+| First stage + tuned rule | 0.9599 | 0.990 | 0.917 | 90.0% | 0.966 | 0.950 |
+| **+ second stage (submitted)** | **0.9625** | 0.989 | 0.922 | 93.3% | 0.969 | 0.953 |
+| Same probabilities, plain 0.5 threshold | 0.9580 | 0.977 | 0.939 | 95.0% | 0.965 | 0.948 |
+| Ceiling (perfect matcher on these candidates) | 0.9916 | | | | | |
+
+- Fold 0 (used for tuning) scores 0.9624, in line with fold 1, so the tuning did not overfit.
+- The 5k validation-split entities that fall in fold 1 score 0.9614.
+- Most important first-stage features (gain): `t_margin` (margin over the best competing S1 for the same record), `t_rank`, numeric-token Jaccard, house-number prefix agreement, numeric conflict, address token-set ratio, Stage 2 candidate score, phonetic name ratio.
+- Selected rule: expected-F0.5 selection with owner normalisation and exclusivity.
+
+**Test predictions** (`output/matching_results.tsv`, 1,732,544 S1 entities; passes the official validator):
+
+| Country | S1 entities | Predicted empty | Matches per S1 |
+|---|---|---|---|
+| US | 663,106 | 5.50% | 3.33 |
+| France (not in training) | 259,452 | 4.63% | 3.41 |
+| India | 809,986 | 5.87% | 3.24 |
+
+**Leaderboard (public): 0.94.** The gap to the local 0.9625 is expected to come from two test-only effects that local validation cannot see. France is unseen in training and has very generic names. And test has more S2/S3 records per S1 entity than train (5.75 vs 4.68), so more records belong to no S1 entity.
+
 
 ---
 
@@ -149,12 +175,13 @@ __STAGE345_RESULTS__
 
 ```text
 .
-├── .gitignore                      # Excludes raw data, model binaries, and caches
-├── README.md                       # Complete project overview and implementation guide
-├── requirements.txt                # Pinned dependencies
+├── .gitignore                      # Excludes raw data, caches and outputs; keeps the final model files
+├── README.md                       # Project overview, methodology, results and run instructions
+├── requirements.txt                # Dependencies
 ├── notebooks/
 │   ├── 01_preprocessing.ipynb     # Stage 1 walkthrough: samples, normalization, val split, full preprocessing
-│   └── 02_blocking.ipynb          # Stage 2 walkthrough: design evidence, keys, val/train/test runs, validation
+│   ├── 02_blocking.ipynb          # Stage 2 walkthrough: design evidence, keys, candidate runs, validation
+│   └── 03_matching.ipynb          # Early Stage 3/4 prototype (superseded by scripts/run_matching.py)
 ├── student_resource/
 │   ├── Documentation_template.md  # Final methodology write-up template
 │   ├── README.md                  # Challenge problem statement documentation
@@ -165,13 +192,17 @@ __STAGE345_RESULTS__
 │   ├── preprocess_dataset.py      # Stage 1: raw TSV -> dataset/preprocessed/ (tsv or parquet)
 │   ├── create_val_split.py        # Validation S1 sample + ground truth
 │   ├── inspect_samples.py         # Print matched record examples
-│   ├── run_blocking.py            # Stage 2 CLI: test / val / train candidate generation
+│   ├── run_blocking.py            # Stage 2 CLI: val / train / full-train / test candidate generation
 │   ├── evaluate_blocking.py       # Stage 2 metrics for any candidate file vs ground truth
-│   └── fit_rescore_weights.py     # Stage 2: refit the candidate-ranking weights on labelled queries
+│   ├── fit_rescore_weights.py     # Stage 2: refit the candidate-ranking weights on labelled queries
+│   ├── run_matching.py            # Stages 3-5 CLI: train / tune / stack / test
+│   └── score_submission.py        # Leaderboard metric for any matching file vs a ground truth
 ├── src/
 │   ├── __init__.py
-│   ├── preprocessing.py           # Text and address cleaning routines
+│   ├── preprocessing.py           # Text and address cleaning (Stage 1)
 │   ├── transliteration.py         # Indic script -> Latin transliteration
+│   ├── phonetic.py                # Phonetic skeleton shared by Stages 1-3
+│   ├── regions.py                 # Country-aware address abbreviations and region codes
 │   ├── blocking/                  # Stage 2: candidate generation
 │   │   ├── config.py              #   passes, rescoring weights, budget (JSON-overridable)
 │   │   ├── normalize.py           #   legal/filler tokens, leet digits, phonetic keys
@@ -180,18 +211,27 @@ __STAGE345_RESULTS__
 │   │   ├── topk.py                #   chunked multithreaded sparse top-k
 │   │   ├── fusion.py              #   union of passes, budgeted top-N selection
 │   │   ├── rescore.py             #   exact pair cosines + candidate score
-│   │   ├── dense.py               #   optional MiniLM + FAISS pass
+│   │   ├── dense.py               #   optional MiniLM + FAISS pass (off by default)
 │   │   ├── pipeline.py            #   orchestration
 │   │   ├── candidates.py          #   CandidateSet + TSV / parquet writers
 │   │   ├── data.py                #   loading preprocessed sources / ground truth
 │   │   ├── evaluation.py          #   pair recall, F0.5 ceiling, reduction ratio, macro F0.5
 │   │   └── tuning.py              #   labelled candidate union + logistic-regression weight fitting
-│   ├── features.py                # (Stage 3) Feature extraction for candidate pairs
-│   ├── train.py                   # (Stage 4) Model training and hyperparameter tuning
-│   └── inference.py               # (Stage 5) Test set scoring
+│   └── matching/                  # Stages 3-5: matching and submission
+│       ├── records.py             #   per-record normalised fields and token matrices
+│       ├── features.py            #   bulk pair features (rapidfuzz cpdist, token overlaps, house numbers)
+│       ├── context.py             #   query-side and record-side competition features
+│       ├── model.py               #   LightGBM matcher
+│       ├── stacking.py            #   second stage on first-stage probabilities in context
+│       ├── decision.py            #   calibration, expected-F0.5 selection, exclusivity
+│       ├── threshold.py           #   exact leaderboard metric
+│       ├── workflow.py            #   per-country streaming, out-of-fold training, evaluation, writers
+│       └── pipeline.py            #   simple threshold-based submission helpers
+├── models/                        # Final models: 2 fold matchers, 2 second-stage models, matching_config.json
 ├── tests/
 │   ├── test_preprocessing.py
-│   └── test_blocking.py           # pytest: normalization, top-k, pipeline, validator format
+│   ├── test_blocking.py           # pytest: normalization, top-k, pipeline, validator format
+│   └── test_matching.py           # pytest: metric, decision rule, features, stacking, end-to-end outputs
 ├── dataset/                       # Generated data (excluded from git)
 │   ├── preprocessed/              #   Stage 1 output
 │   ├── val_split/                 #   validation ground truth
@@ -219,11 +259,18 @@ python scripts/run_blocking.py --split train --all-train --no-tsv
 # Stage 2 on test -> output/candidate_pairs.tsv + dataset/candidates/test_candidate_pairs.parquet
 python scripts/run_blocking.py --split test
 
-# Stages 3-5: out-of-fold training + decision tuning + honest report, then test submission
+# Stages 3-5, exactly as used for the submitted output:
+#   first stage: out-of-fold training on the full-train universe, decision tuning, honest report
 python scripts/run_matching.py --mode train
+#   second stage on the saved out-of-fold probabilities (adopted only if it beats the first stage on fold 0)
+python scripts/run_matching.py --mode stack
+#   test inference -> output/matching_results.tsv + output/candidate_pairs.tsv, then the official validator
 python scripts/run_matching.py --mode test
-# (re-tune the decision rule from saved OOF arrays without retraining)
+# (optional) re-tune the decision rule from the saved out-of-fold arrays without retraining
 python scripts/run_matching.py --mode tune
+
+# The committed models/ are the ones behind the submitted file. To regenerate the output
+# without retraining, run Stages 1-2 for the test split and then only `--mode test`.
 
 # Re-evaluate / re-cut a candidate set to a smaller budget
 python scripts/evaluate_blocking.py --candidates dataset/candidates/val_candidate_pairs.parquet --max-per-source 15
@@ -232,7 +279,7 @@ python scripts/evaluate_blocking.py --candidates dataset/candidates/val_candidat
 python scripts/fit_rescore_weights.py
 
 # Tests
-python -m pytest tests/test_blocking.py -q
+python -m pytest tests -q
 ```
 
 The notebooks (`notebooks/01_preprocessing.ipynb`, `notebooks/02_blocking.ipynb`) walk through each stage on real data and call these same scripts. All pipeline logic lives in `src/`, and the scripts are the reproducible command-line entry points.
