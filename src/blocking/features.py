@@ -20,6 +20,7 @@ Views:
     name_pkey_pair  unordered pairs of phonetic keys ('gold prodakts' ~ 'gold products').
     addr_word   address tokens incl. house numbers. Catches records whose name is
                 a DBA/trade name or random noise but whose address matches.
+    addr_num    numeric address tokens (house / plot / unit numbers).
     addr_bigram adjacent address token pairs ('10528_cedar', 'cedar_falls').
     addr_numstreet  house number + following word.
     name_addr   name token x address token cross keys. Survives heavy noise on either
@@ -36,7 +37,7 @@ from src.blocking.normalize import address_tokens, name_tokens, phonetic_key, ph
 
 VIEW_NAMES = (
     "name_char", "name_phon", "name_word", "name_pkey", "name_affix", "name_compact", "name_del",
-    "name_pair", "name_pkey_pair", "addr_word", "addr_bigram", "addr_numstreet", "name_addr",
+    "name_pair", "name_pkey_pair", "addr_word", "addr_num", "addr_bigram", "addr_numstreet", "name_addr",
 )
 
 
@@ -83,6 +84,8 @@ def _view_features(view: str, ntoks: List[str], atoks: List[str], ngram: int) ->
         return _pairs([k for k in (phonetic_key(t) for t in ntoks) if len(k) >= 2])
     if view == "addr_word":
         return atoks
+    if view == "addr_num":
+        return [t for t in atoks if t.isdigit()]
     if view == "addr_bigram":
         return [f"{a}_{b}" for a, b in zip(atoks, atoks[1:])]
     if view == "name_addr":
@@ -153,4 +156,7 @@ def featurize(
         parts = Parallel(n_jobs=n_jobs)(
             delayed(_hash_chunk)(names[a:b], addresses[a:b], views, hash_bits, ngram) for a, b in bounds
         )
-    return {v: sp.vstack([p[v] for p in parts], format="csr") for v in views}
+    out = {}
+    for v in views:  # stack view by view, releasing each chunk as soon as it is consumed
+        out[v] = sp.vstack([p.pop(v) for p in parts], format="csr")
+    return out

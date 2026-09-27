@@ -1,16 +1,15 @@
 """
-Stage 4: End-to-end matching pipeline and submission generator.
+Stage 4/5: submission table helpers.
 
-Outputs matching_results.tsv compliant with official competition rules.
+Outputs matching_results.tsv compliant with the official competition rules. The
+full train/evaluate/infer workflow lives in workflow.py and scripts/run_matching.py.
 """
 
 import os
 from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
-from .features import extract_pair_features
 from .model import MatcherModel
-from .threshold import evaluate_f05
 
 
 def generate_matching_results(
@@ -19,46 +18,29 @@ def generate_matching_results(
     all_query_ids: List[str],
     threshold: float = 0.70,
 ) -> pd.DataFrame:
-    """Generate final matching results table.
+    """Final matching table from pair probabilities and a global threshold.
 
-    Every query in all_query_ids has exactly one row.
-    If no candidate passes the threshold, matched_entity_ids is empty.
+    Every query in `all_query_ids` gets exactly one row (in that order);
+    matched ids are de-duplicated and ordered by descending probability, and
+    the list is empty when nothing passes the threshold. The production path
+    (scripts/run_matching.py) uses the tuned decision rule in decision.py
+    instead of a single threshold.
     """
     q_col = "source1_entity_id" if "source1_entity_id" in candidates_df.columns else "query_id"
     c_col = "candidate_entity_id" if "candidate_entity_id" in candidates_df.columns else "candidate_id"
     df = pd.DataFrame({
-        "query_id": candidates_df[q_col].values,
-        "candidate_id": candidates_df[c_col].values,
-        "prob": probabilities,
+        "query_id": candidates_df[q_col].to_numpy(),
+        "candidate_id": candidates_df[c_col].to_numpy(),
+        "prob": np.asarray(probabilities),
     })
-
-    # Filter by threshold
-    passing = df[df["prob"] >= threshold]
-
-    # Group by query and collect sorted matches
-    matched_map = {}
-    if not passing.empty:
-        # Sort by query_id and prob descending
-        passing_sorted = passing.sort_values(["query_id", "prob"], ascending=[True, False])
-        for qid, group in passing_sorted.groupby("query_id"):
-            # Deduplicate while preserving rank order
-            seen = set()
-            unique_matches = []
-            for cid in group["candidate_id"]:
-                if cid not in seen:
-                    seen.add(cid)
-                    unique_matches.append(cid)
-            matched_map[qid] = ",".join(unique_matches)
-
-    # Build final rows for every query ID in original order
-    rows = []
-    for qid in all_query_ids:
-        rows.append({
-            "source1_entity_id": qid,
-            "matched_entity_ids": matched_map.get(qid, ""),
-        })
-
-    return pd.DataFrame(rows)
+    passing = df[df["prob"] >= threshold].sort_values(["query_id", "prob"], ascending=[True, False])
+    passing = passing.drop_duplicates(["query_id", "candidate_id"])
+    matched = passing.groupby("query_id", sort=False)["candidate_id"].agg(",".join)
+    ids = pd.Index(all_query_ids)
+    return pd.DataFrame({
+        "source1_entity_id": ids,
+        "matched_entity_ids": matched.reindex(ids).fillna("").to_numpy(),
+    })
 
 
 def write_submission(df: pd.DataFrame, output_path: str) -> None:

@@ -121,7 +121,17 @@ class CandidateSet:
             if writer is not None:
                 writer.close()
 
-    def to_frame(self) -> pd.DataFrame:
-        """All pairs as one DataFrame (use for small query sets such as validation)."""
-        frames = list(self.iter_frames(chunk_queries=max(len(self.query_ids), 1)))
-        return frames[0] if frames else pd.DataFrame()
+    def to_frame(self, query_rows: np.ndarray = None) -> pd.DataFrame:
+        """Pairs as one DataFrame with string ids, optionally only for `query_rows`.
+
+        Materialising strings is memory-heavy, so for large runs pass a subset.
+        """
+        keep = None if query_rows is None else np.isin(self.q, query_rows)
+        sub = self if keep is None else CandidateSet(
+            query_ids=self.query_ids, query_country=self.query_country, source_names=self.source_names,
+            target_ids=self.target_ids, feature_names=self.feature_names, q=self.q[keep], src=self.src[keep],
+            t=self.t[keep], score=self.score[keep], source_rank=self.source_rank[keep],
+            features=self.features[keep],
+        )
+        frames = [f for f in sub.iter_frames(chunk_queries=max(len(self.query_ids), 1)) if not f.empty]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

@@ -12,6 +12,10 @@ Reads Stage 1 output from dataset/preprocessed/ and produces candidate pairs.
     # Training candidates for Stage 3 (random train S1 sample, val entities excluded)
     python scripts/run_blocking.py --split train --sample-s1 200000
 
+    # Full train universe (all 2.2M train S1, incl. val) = local replica of the test setting;
+    # Stage 3/4 trains and evaluates on it with query-level folds
+    python scripts/run_blocking.py --split train --all-train --no-tsv
+
 Outputs (val/train go to --out-dir, default dataset/candidates/):
     {split}_candidate_pairs.tsv       submission format (one row per S1 entity)
     {split}_candidate_pairs.parquet   one row per pair with scores / similarities
@@ -49,6 +53,8 @@ def load_queries(args):
 
     # split == "train": optional random sample, never overlapping the validation queries
     gt = load_ground_truth(args.train_gt)
+    if args.all_train:
+        return s1, gt
     if os.path.exists(args.val_gt):
         s1 = s1[~s1["entity_id"].isin(read_id_set(args.val_gt))]
     if args.sample_s1:
@@ -74,6 +80,11 @@ def main():
     parser.add_argument("--n-jobs", type=int, default=None)
     parser.add_argument("--dense", action="store_true", help="enable the optional dense (MiniLM + FAISS) pass")
     parser.add_argument("--no-parquet", action="store_true", help="skip the scored parquet output")
+    parser.add_argument("--no-tsv", action="store_true", help="val/train only: skip the candidate TSV")
+    parser.add_argument("--all-train", action="store_true",
+                        help="train only: every train S1 (val included), for full-scale Stage 3/4 evaluation")
+    parser.add_argument("--eval-max-queries", type=int, default=50_000,
+                        help="evaluate recall on at most this many random queries (bounds memory)")
     args = parser.parse_args()
 
     cfg = BlockingConfig.load(args.config)
@@ -101,14 +112,16 @@ def main():
     candidates = pipeline.run(queries, targets)
 
     os.makedirs(args.out_dir, exist_ok=True)
+    name = "train_full" if args.split == "train" and args.all_train else args.split
     if args.split == "test":
         tsv_path = os.path.join(args.submission_dir, "candidate_pairs.tsv")
     else:
-        tsv_path = os.path.join(args.out_dir, f"{args.split}_candidate_pairs.tsv")
-    candidates.write_tsv(tsv_path)
-    print(f"Wrote {tsv_path}")
+        tsv_path = os.path.join(args.out_dir, f"{name}_candidate_pairs.tsv")
+    if args.split == "test" or not args.no_tsv:
+        candidates.write_tsv(tsv_path)
+        print(f"Wrote {tsv_path}")
     if not args.no_parquet:
-        pq_path = os.path.join(args.out_dir, f"{args.split}_candidate_pairs.parquet")
+        pq_path = os.path.join(args.out_dir, f"{name}_candidate_pairs.parquet")
         try:
             candidates.write_parquet(pq_path)
             print(f"Wrote {pq_path}")
@@ -133,14 +146,19 @@ def main():
         "config": cfg.to_dict(),
     }
     if gt is not None:
+        rows = np.arange(len(queries))
+        if len(rows) > args.eval_max_queries:
+            rows = np.sort(np.random.default_rng(args.seed).choice(rows, args.eval_max_queries, replace=False))
+            print(f"Evaluating recall on a random {len(rows):,}-query subset")
+        gt = gt[gt["source1_entity_id"].isin(set(queries["entity_id"].to_numpy()[rows]))]
         metrics = evaluate_candidates(
-            candidates.to_frame(), gt, n_targets=n_targets,
+            candidates.to_frame(rows), gt, n_targets=n_targets,
             query_country=pd.Series(queries["country"].to_numpy(), index=queries["entity_id"]),
         )
         report["metrics"] = metrics
         print("\n" + format_report(metrics))
 
-    report_path = os.path.join(args.out_dir, f"{args.split}_blocking_report.json")
+    report_path = os.path.join(args.out_dir, f"{name}_blocking_report.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
     print(f"\nWrote {report_path} ({report['seconds'] / 60:.1f} min total)")

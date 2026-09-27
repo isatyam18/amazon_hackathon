@@ -5,7 +5,7 @@ Handles:
 - Indic script transliteration (Devanagari, Tamil, Telugu, ... -> Latin; see transliteration.py)
 - Unicode normalization and de-accenting (for multilingual data: US, India, France)
 - Business name cleaning and legal suffix stripping (US, Indian, and French legal forms)
-- Address standardization (abbreviations, directional cues, landmark normalization)
+- Address standardization (country-aware abbreviations, region-name canonicalization)
 - Tokenization, postal code extraction, and numerical token isolation
 """
 
@@ -13,6 +13,7 @@ import re
 import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
 
+from src.regions import GENERIC_ADDRESS_EXPANSIONS, canonicalize_regions, expand_address_tokens
 from src.transliteration import transliterate_indic
 
 
@@ -63,36 +64,8 @@ LEGAL_SUFFIX_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Address abbreviations dictionary
-ADDRESS_EXPANSIONS = {
-    r"\bst\b": "street",
-    r"\brd\b": "road",
-    r"\bave\b": "avenue",
-    r"\bav\b": "avenue",
-    r"\bblvd\b": "boulevard",
-    r"\bdr\b": "drive",
-    r"\bln\b": "lane",
-    r"\bhwy\b": "highway",
-    r"\bct\b": "court",
-    r"\bpl\b": "place",
-    r"\bpkwy\b": "parkway",
-    r"\bfl\b": "floor",
-    r"\bflr\b": "floor",
-    r"\bste\b": "suite",
-    r"\bapt\b": "apartment",
-    r"\brm\b": "room",
-    r"\bopp\b": "opposite",
-    r"\bnr\b": "near",
-    r"\bbldg\b": "building",
-    r"\bno\b": "number",
-    r"\bdist\b": "district",
-    r"\bstr\b": "street",
-}
-
-ADDRESS_PATTERNS = [
-    (re.compile(pattern, re.IGNORECASE), replacement)
-    for pattern, replacement in ADDRESS_EXPANSIONS.items()
-]
+# Address abbreviation and region tables are country-aware (see regions.py)
+ADDRESS_EXPANSIONS = GENERIC_ADDRESS_EXPANSIONS
 
 
 def clean_text(text: Optional[str]) -> str:
@@ -138,16 +111,20 @@ def clean_business_name(name: Optional[str]) -> Tuple[str, str, str]:
     return cleaned, core, suffix
 
 
-def clean_address(address: Optional[str]) -> str:
-    """Standardize street types, abbreviations, and landmark tokens in address."""
+def clean_address(address: Optional[str], country: Optional[str] = None) -> str:
+    """Standardize street types, abbreviations and region names in an address.
+
+    Expansions depend on the country label ('st' is Street in the US but Saint in
+    France); region names ('north carolina', 'maharashtra', transliterated
+    'maharashtr') become one canonical code per country. Unknown countries get
+    the generic table and no region mapping.
+    """
     cleaned = clean_text(address)
     if not cleaned:
         return ""
-
-    for pattern, replacement in ADDRESS_PATTERNS:
-        cleaned = pattern.sub(replacement, cleaned)
-
-    return re.sub(r"\s+", " ", cleaned).strip()
+    tokens = expand_address_tokens(cleaned.split(), country)
+    tokens = canonicalize_regions(tokens, country)
+    return " ".join(tokens)
 
 
 def extract_postal_code(address: Optional[str], country: str) -> Optional[str]:
@@ -189,7 +166,7 @@ def preprocess_record(record: Dict[str, str]) -> Dict[str, any]:
     country = str(record.get("country", "")).strip().lower()
 
     clean_name, core_name, suffix = clean_business_name(raw_name)
-    cleaned_addr = clean_address(raw_addr)
+    cleaned_addr = clean_address(raw_addr, country)
     postal_code = extract_postal_code(raw_addr, country)
 
     return {

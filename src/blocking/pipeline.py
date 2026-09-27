@@ -162,7 +162,7 @@ class BlockingPipeline:
                     out["t"].append(t_rows[ti].astype(np.int32))
                     out["score"].append(score)
                     out["rank"].append(rank.astype(np.int16))
-                    out["features"].append(features)
+                    out["features"].append(features.astype(np.float16))  # stored as float16 in parquet anyway
                     n_pairs += len(qi)
                     done = min(b + cfg.query_block_size, len(q_rows))
                     if done < len(q_rows):
@@ -188,5 +188,5 @@ class BlockingPipeline:
             t=cat("t", np.int32),
             score=cat("score", np.float32),
             source_rank=cat("rank", np.int16),
-            features=cat("features", np.float32, (0, len(self.feature_names))),
+            features=cat("features", np.float16, (0, len(self.feature_names))),
         )

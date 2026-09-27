@@ -18,6 +18,7 @@ vowel is dropped at the end of a word (Hindi-style schwa deletion), and
 nukta/length marks are folded into the base letter.
 """
 
+import re
 from typing import Dict
 
 INDIC_START = 0x0900
@@ -53,7 +54,10 @@ _VOWEL_SIGNS: Dict[int, str] = {
 
 _VIRAMA = 0x4D
 _NUKTA = 0x3C
-_NASALS = (0x01, 0x02)  # candrabindu, anusvara
+_CANDRABINDU = 0x01
+_ANUSVARA = 0x02
+_ANUSVARA_MARK = ""  # placeholder resolved once the following letter is known
+_ANUSVARA_AS_M = re.compile(_ANUSVARA_MARK + r"(?=[pbm]|[^a-z]|$)")
 _VISARGA = 0x03
 _DANDAS = (0x64, 0x65)
 _GURMUKHI_TIPPI = 0x0A70
@@ -131,9 +135,13 @@ def transliterate_indic(text: str) -> str:
         elif off in _VOWELS:
             flush_inherent()
             out.append(_VOWELS[off])
-        elif off in _NASALS:
+        elif off == _CANDRABINDU:
             flush_inherent()
             out.append("n")
+        elif off == _ANUSVARA:
+            # Homorganic nasal: 'm' before labials and at word end (keralam, sampark), else 'n'
+            flush_inherent()
+            out.append(_ANUSVARA_MARK)
         elif off == _VISARGA:
             flush_inherent()
             out.append("h")
@@ -145,4 +153,5 @@ def transliterate_indic(text: str) -> str:
             out.append(" ")
         # Anything else (length marks, avagraha, addak, abbreviation signs) is dropped
 
-    return "".join(out)
+    text = _ANUSVARA_AS_M.sub("m", "".join(out))
+    return text.replace(_ANUSVARA_MARK, "n")

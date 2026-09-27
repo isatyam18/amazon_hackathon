@@ -86,8 +86,9 @@ class BlockingConfig:
 
     # Exact-similarity views used to rank the retrieved union, with their weights
     rescore_weights: Dict[str, float] = field(default_factory=default_rescore_weights)
-    # Final budget: at most this many candidates per S1 entity from EACH of S2 and S3
-    max_candidates_per_source: int = 25
+    # Final budget: at most this many candidates per S1 entity from EACH of S2 and S3.
+    # 15 keeps 97.6% of true pairs on validation (25: 97.8%) with 40% fewer pairs to score.
+    max_candidates_per_source: int = 15
     # Candidates whose rescored score is below this are dropped (0 keeps everything retrieved)
     min_candidate_score: float = 0.0
 

@@ -1,288 +1,247 @@
 """
-Stage 3 & 4 CLI: Feature Extraction, Model Training, and Submission Inference.
+Stages 3-5 CLI: pair features, LightGBM matcher, decision rule, submission files.
 
 Modes:
-  1. train:
-     Extracts features, trains LightGBM, tunes decision threshold on validation for Macro F_0.5,
-     and saves the model.
-     python scripts/run_matching.py --mode train
+  train  Full-train universe (scripts/run_blocking.py --split train --all-train):
+         2-fold out-of-fold training, then calibration + decision-rule tuning on
+         fold 0 and an honest leaderboard-metric report on fold 1. Saves models/,
+         models/oof/ (out-of-fold arrays) and models/matching_config.json.
+         python scripts/run_matching.py --mode train
 
-  2. test:
-     Extracts features on test candidates, scores them with the trained model,
-     filters by optimal threshold, generates output/matching_results.tsv,
-     and validates format.
-     python scripts/run_matching.py --mode test
+  tune   Re-run calibration, decision-rule tuning and the report from the saved OOF
+         arrays (no retraining; seconds to minutes).
+         python scripts/run_matching.py --mode tune
 
-  3. all (default):
-     Runs training, threshold tuning, and test inference end-to-end.
+  stack  Train the second-stage model on the saved OOF probabilities (probability-context
+         features: best competing S1 for the same record, other strong candidates of the
+         same S1), re-tune and report with the same fold protocol. It is adopted
+         (models/stack_fold*.txt, config "stack_models") only if it beats the first stage
+         on fold 0.
+         python scripts/run_matching.py --mode stack
+
+  test   Scores the test candidates with both fold models, applies the tuned rule and
+         writes output/matching_results.tsv and output/candidate_pairs.tsv (exactly the
+         pairs the model scored), then runs the official validator.
+         python scripts/run_matching.py --mode test
+
+  all    train, then test (default).
 """
 
 import argparse
+import glob
 import json
 import os
+import subprocess
 import sys
-import time
+
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.matching.features import extract_pair_features
-from src.matching.model import MatcherModel, train_matcher
-from src.matching.threshold import find_optimal_threshold, evaluate_f05
-from src.matching.pipeline import generate_matching_results, write_submission
+from src.blocking.data import load_ground_truth, read_id_set
+from src.matching.decision import Calibrator, DecisionRule
+from src.matching.model import MatcherModel
+from src.matching.workflow import (
+    PartitionResult,
+    Universe,
+    default_rule_grid,
+    evaluate,
+    predict_and_write,
+    query_folds,
+    select_all,
+    train_oof,
+    tune_decision,
+)
 
 
-def load_preprocessed_lookup(preprocessed_dir: str, split: str = "train") -> dict:
-    """Load preprocessed source files and build fast lookup mapping: entity_id -> dict.
-    Supports both .parquet and .tsv formats seamlessly.
-    """
-    print(f"Loading preprocessed lookup records for {split}...")
-    lookup = {}
-    sources = [1, 2, 3]
-    for s in sources:
-        parquet_path = os.path.join(preprocessed_dir, f"{split}_source{s}.parquet")
-        tsv_path = os.path.join(preprocessed_dir, f"{split}_source{s}.tsv")
-        df = None
-        if os.path.exists(parquet_path):
-            df = pd.read_parquet(parquet_path)
-            print(f"  Loaded {split}_source{s}.parquet: {len(df):,} records")
-        elif os.path.exists(tsv_path):
-            df = pd.read_csv(tsv_path, sep="\t", dtype=str)
-            print(f"  Loaded {split}_source{s}.tsv: {len(df):,} records")
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def fmt(report: dict) -> str:
+    lines = []
+    for k, v in report.items():
+        if k == "macro_f05_by_country":
+            lines.append(f"    {k:<26}: " + ", ".join(f"{c}={s:.4f}" for c, s in v.items()))
+        elif isinstance(v, float):
+            lines.append(f"    {k:<26}: {v:.5f}")
         else:
-            print(f"  Warning: Neither {parquet_path} nor {tsv_path} found.")
-            continue
-
-        for _, r in df.iterrows():
-            eid = r.get("entity_id")
-            if eid:
-                lookup[eid] = {
-                    "clean_name": str(r.get("clean_name", "") or ""),
-                    "core_name": str(r.get("core_name", "") or r.get("clean_name", "") or ""),
-                    "clean_address": str(r.get("clean_address", "") or ""),
-                    "postal_code": str(r.get("postal_code", "") or ""),
-                }
-    return lookup
+            lines.append(f"    {k:<26}: {v:,}")
+    return "\n".join(lines)
 
 
-def run_train_and_tune(args):
-    print("\n" + "=" * 60)
-    print("STAGE 3 & 4: MODEL TRAINING & THRESHOLD TUNING")
-    print("=" * 60)
+def tune_and_report(args, universe: Universe, folds: np.ndarray, results) -> dict:
+    """Calibration + rule on fold 0, honest report on fold 1."""
+    tune_mask, report_mask = folds == 0, folds == 1
+    labels = [r.labels() for r in results]
+    fold0 = [tune_mask[r.q] for r in results]
+    calibrator = Calibrator().fit(np.concatenate([r.prob[m] for r, m in zip(results, fold0)]),
+                                  np.concatenate([l[m] for l, m in zip(labels, fold0)]))
+    probs = [calibrator.transform(r.prob) for r in results]
 
-    # 1. Load preprocessed text lookup
-    train_lookup = load_preprocessed_lookup(args.preprocessed_dir, split="train")
+    missed = 0
+    for r, l in zip(results, labels):
+        n_true = np.bincount(r.truth_q, minlength=len(universe))
+        in_cands = np.bincount(r.q[l], minlength=len(universe))
+        rows = r.query_rows[tune_mask[r.query_rows]]
+        missed += int((n_true - in_cands)[rows].sum())
+    missing_mass = missed / max(int(tune_mask.sum()), 1)
+    log(f"\n[matching] true matches per S1 missed by blocking (fold 0): {missing_mass:.4f}")
+    log("[matching] decision-rule grid on fold 0:")
+    rule, grid = tune_decision(results, probs, universe, tune_mask, default_rule_grid(missing_mass), log=log)
+    log(f"[matching] selected rule: {rule.to_dict()}")
 
-    # 2. Load candidate pairs
-    print(f"\nLoading training candidates from: {args.train_candidates}")
-    train_candidates = pd.read_parquet(args.train_candidates)
-    print(f"Training pairs: {len(train_candidates):,}")
+    n = len(universe)
+    selected = select_all(rule, results, probs)
+    report = {"fold1": evaluate(results, selected, n, report_mask, universe.s1_country),
+              "fold0_tuning": evaluate(results, selected, n, tune_mask, universe.s1_country)}
+    baseline = DecisionRule("threshold", threshold=0.5, owner_normalize=False, exclusive=False)
+    report["fold1_baseline_threshold_0.5"] = evaluate(
+        results, select_all(baseline, results, probs), n, report_mask, universe.s1_country)
+    if os.path.exists(args.val_gt):
+        val_mask = np.isin(universe.s1_ids, list(read_id_set(args.val_gt))) & report_mask
+        report["val_split_fold1"] = evaluate(results, selected, n, val_mask, universe.s1_country)
+    for name in ("fold1", "fold1_baseline_threshold_0.5", "fold0_tuning", "val_split_fold1"):
+        if name in report:
+            log(f"\n[{name}]\n{fmt(report[name])}")
+    return {"calibrator": calibrator.to_dict(), "decision_rule": rule.to_dict(), "rule_grid": grid,
+            "missing_mass": missing_mass, "report": report}
 
-    # 3. Label training candidates using ground truth
-    print(f"Loading ground truth: {args.train_gt}")
-    gt_df = pd.read_csv(args.train_gt, sep="\t")
-    gt_map = {}
-    for _, r in gt_df.iterrows():
-        qid = r["source1_entity_id"]
-        m_str = str(r["matched_entity_ids"]) if pd.notna(r["matched_entity_ids"]) else ""
-        gt_map[qid] = {m.strip() for m in m_str.split(",") if m.strip()}
 
-    q_col = "source1_entity_id" if "source1_entity_id" in train_candidates.columns else "query_id"
-    c_col = "candidate_entity_id" if "candidate_entity_id" in train_candidates.columns else "candidate_id"
-    q_ids = train_candidates[q_col].values
-    c_ids = train_candidates[c_col].values
-
-    labels = []
-    for qid, cid in zip(q_ids, c_ids):
-        labels.append(1 if cid in gt_map.get(qid, set()) else 0)
-    y_train = np.array(labels, dtype=int)
-    print(f"Positive pairs: {y_train.sum():,} ({y_train.mean()*100:.2f}%), Negative pairs: {(1-y_train).sum():,}")
-
-    # 4. Extract Stage 3 Features for Training
-    print("\nExtracting fine-grained Stage 3 features for training pairs...")
-    t0 = time.time()
-    X_train = extract_pair_features(train_candidates, train_lookup)
-    print(f"Extracted {X_train.shape[1]} features in {time.time()-t0:.1f}s.")
-
-    # 5. Handle Validation Set
-    X_val, y_val = None, None
-    val_candidates = None
-    if os.path.exists(args.val_candidates):
-        print(f"\nLoading validation candidates from: {args.val_candidates}")
-        val_candidates = pd.read_parquet(args.val_candidates)
-        val_gt_df = pd.read_csv(args.val_gt, sep="\t") if os.path.exists(args.val_gt) else gt_df
-        val_gt_map = {}
-        for _, r in val_gt_df.iterrows():
-            qid = r["source1_entity_id"]
-            m_str = str(r["matched_entity_ids"]) if pd.notna(r["matched_entity_ids"]) else ""
-            val_gt_map[qid] = {m.strip() for m in m_str.split(",") if m.strip()}
-
-        vq_col = "source1_entity_id" if "source1_entity_id" in val_candidates.columns else "query_id"
-        vc_col = "candidate_entity_id" if "candidate_entity_id" in val_candidates.columns else "candidate_id"
-        val_labels = [1 if cid in val_gt_map.get(qid, set()) else 0
-                      for qid, cid in zip(val_candidates[vq_col], val_candidates[vc_col])]
-        y_val = np.array(val_labels, dtype=int)
-        X_val = extract_pair_features(val_candidates, train_lookup)
-
-    # 6. Train LightGBM Model
-    print("\nTraining LightGBM Matcher...")
-    model = train_matcher(
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        num_boost_round=args.num_boost_round,
+def run_train(args) -> None:
+    log("=" * 70 + "\nSTAGES 3-4: OUT-OF-FOLD TRAINING, DECISION TUNING, EVALUATION\n" + "=" * 70)
+    models, universe, folds, results = train_oof(
+        args.train_candidates, args.preprocessed_dir, load_ground_truth(args.train_gt), "train",
+        n_train_queries=args.train_queries, seed=args.seed, n_jobs=args.n_jobs,
+        results_dir=os.path.join(args.model_dir, "oof"), log=log,
     )
+    importances = models[0].get_feature_importances()
+    log("\nTop features (gain, fold-0 model):\n" + importances.head(25).to_string(index=False))
 
-    # Save model
-    os.makedirs(os.path.dirname(args.model_path) or ".", exist_ok=True)
-    model.save(args.model_path)
-    print(f"Model saved to: {args.model_path}")
-
-    # Show top features
-    print("\nTop 10 Feature Importances (Gain):")
-    print(model.get_feature_importances().head(10).to_string(index=False))
-
-    # 7. Tune Decision Threshold for Macro F_0.5
-    optimal_threshold = args.threshold
-    if val_candidates is not None and len(val_candidates) > 0:
-        print("\nOptimizing Decision Threshold for Macro F_0.5 on Validation Split...")
-        val_probs = model.predict_proba(X_val)
-        best_t, best_score, score_curve = find_optimal_threshold(
-            val_candidates, val_probs, val_gt_map, threshold_range=(0.40, 0.90, 0.02)
-        )
-        print(f"\nOptimal Decision Threshold: {best_t:.2f} -> Validation Macro F_0.5 = {best_score:.4f}")
-        optimal_threshold = best_t
-
-        # Save report
-        report = {
-            "best_threshold": best_t,
-            "best_macro_f05": best_score,
-            "threshold_curve": score_curve,
-        }
-        report_dir = os.path.dirname(args.val_candidates) or "dataset/candidates"
-        report_path = os.path.join(report_dir, "threshold_tuning_report.json")
-        os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
-        with open(report_path, "w") as f:
-            json.dump(report, f, indent=2)
-        print(f"Tuning report saved to: {report_path}")
-
-    return model, optimal_threshold
+    os.makedirs(args.model_dir, exist_ok=True)
+    for i, m in enumerate(models):
+        m.save(os.path.join(args.model_dir, f"matcher_fold{i}.txt"))
+    config = {
+        "models": [f"matcher_fold{i}.txt" for i in range(len(models))],
+        "feature_names": models[0].feature_names,
+        "feature_importance": importances.to_dict(orient="records"),
+    }
+    config.update(tune_and_report(args, universe, folds, results))
+    with open(os.path.join(args.model_dir, "matching_config.json"), "w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2)
+    log(f"\nSaved models, OOF arrays and {os.path.join(args.model_dir, 'matching_config.json')}")
 
 
-def run_test_inference(args, model, threshold):
-    print("\n" + "=" * 60)
-    print("STAGE 4: TEST INFERENCE & SUBMISSION GENERATION")
-    print("=" * 60)
+def run_tune(args) -> None:
+    log("=" * 70 + "\nSTAGE 4: DECISION TUNING FROM SAVED OOF ARRAYS\n" + "=" * 70)
+    universe = Universe.load(args.preprocessed_dir, "train")
+    folds = query_folds(universe.s1_ids)
+    results = [PartitionResult.load(p) for p in sorted(glob.glob(os.path.join(args.model_dir, "oof", "oof_*.npz")))]
+    if not results:
+        sys.exit("No OOF arrays in models/oof/. Run --mode train first.")
+    config_path = os.path.join(args.model_dir, "matching_config.json")
+    config = json.load(open(config_path, encoding="utf-8")) if os.path.exists(config_path) else {}
+    config.update(tune_and_report(args, universe, folds, results))
+    with open(config_path, "w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2)
+    log(f"\nUpdated {config_path}")
 
-    # 1. Load test preprocessed lookup
-    test_lookup = load_preprocessed_lookup(args.preprocessed_dir, split="test")
 
-    # 2. Load test candidate pairs
-    print(f"\nLoading test candidates from: {args.test_candidates}")
-    test_candidates = pd.read_parquet(args.test_candidates)
-    print(f"Total test candidate pairs to score: {len(test_candidates):,}")
+def run_stack(args) -> None:
+    from src.matching.stacking import train_stack
 
-    # 3. Load all test query IDs (every S1 query must appear in submission!)
-    test_s1_parquet = os.path.join(args.preprocessed_dir, "test_source1.parquet")
-    test_s1_tsv = os.path.join(args.preprocessed_dir, "test_source1.tsv")
-    test_s1_raw = "student_resource/dataset/test/test_source1.tsv"
+    log("=" * 70 + "\nSTAGE 4b: SECOND-STAGE (STACKED) MODEL ON OOF PROBABILITIES\n" + "=" * 70)
+    universe = Universe.load(args.preprocessed_dir, "train")
+    folds = query_folds(universe.s1_ids)
+    results = [PartitionResult.load(p) for p in sorted(glob.glob(os.path.join(args.model_dir, "oof", "oof_*.npz")))]
+    config_path = os.path.join(args.model_dir, "matching_config.json")
+    config = json.load(open(config_path, encoding="utf-8"))
+    first_stage = config["report"]["fold0_tuning"]["macro_f05"]
 
-    if os.path.exists(test_s1_parquet):
-        test_s1_df = pd.read_parquet(test_s1_parquet, columns=["entity_id"])
-    elif os.path.exists(test_s1_tsv):
-        test_s1_df = pd.read_csv(test_s1_tsv, sep="\t", usecols=["entity_id"])
-    elif os.path.exists(test_s1_raw):
-        test_s1_df = pd.read_csv(test_s1_raw, sep="\t", usecols=["entity_id"])
+    models, stacked = train_stack(results, folds, log=log)
+    for r, p in zip(results, stacked):
+        r.prob = p
+    outcome = tune_and_report(args, universe, folds, results)
+    second_stage = outcome["report"]["fold0_tuning"]["macro_f05"]
+    log(f"\n[stacking] fold-0 macro F0.5: first stage {first_stage:.5f} -> second stage {second_stage:.5f}")
+    if second_stage > first_stage:
+        for i, m in enumerate(models):
+            m.save(os.path.join(args.model_dir, f"stack_fold{i}.txt"))
+        config["first_stage_report"] = config["report"]
+        config.update(outcome)
+        config["stack_models"] = [f"stack_fold{i}.txt" for i in range(len(models))]
+        with open(config_path, "w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2)
+        log(f"[stacking] adopted: {config_path} updated")
     else:
-        sys.exit("Error: Could not locate test_source1 to get all query IDs.")
+        log("[stacking] not adopted (no gain on fold 0)")
 
-    all_query_ids = list(test_s1_df["entity_id"])
-    print(f"Total test Source 1 queries: {len(all_query_ids):,}")
 
-    # 4. Extract Stage 3 Features for Test
-    print("\nExtracting features for test candidate pairs...")
-    t0 = time.time()
-    X_test = extract_pair_features(test_candidates, test_lookup)
-    print(f"Extracted {X_test.shape[1]} features in {time.time()-t0:.1f}s.")
+def run_test(args) -> None:
+    log("=" * 70 + "\nSTAGE 5: TEST INFERENCE AND SUBMISSION FILES\n" + "=" * 70)
+    with open(os.path.join(args.model_dir, "matching_config.json"), encoding="utf-8") as fh:
+        config = json.load(fh)
+    models = [MatcherModel.load(os.path.join(args.model_dir, name)) for name in config["models"]]
+    calibrator = Calibrator.from_dict(config["calibrator"])
+    rule = DecisionRule(**config["decision_rule"])
+    stack_models = [MatcherModel.load(os.path.join(args.model_dir, n)) for n in config.get("stack_models", [])]
+    log(f"[matching] rule: {rule.to_dict()} | second stage: {bool(stack_models)}")
 
-    # 5. Predict Probabilities & Generate Submission Table
-    print(f"\nRunning model inference with decision threshold tau = {threshold:.2f}...")
-    probs = model.predict_proba(X_test)
-    submission_df = generate_matching_results(test_candidates, probs, all_query_ids, threshold=threshold)
+    matching_path = os.path.join(args.output_dir, "matching_results.tsv")
+    candidate_path = os.path.join(args.output_dir, "candidate_pairs.tsv")
+    stats = predict_and_write(args.test_candidates, args.preprocessed_dir, "test", models, calibrator, rule,
+                              matching_path, candidate_path, n_jobs=args.n_jobs, log=log,
+                              stack_models=stack_models)
+    log(f"[matching] wrote {matching_path} and {candidate_path}: {json.dumps(stats)}")
+    with open(os.path.join(args.model_dir, "test_prediction_stats.json"), "w", encoding="utf-8") as fh:
+        json.dump(stats, fh, indent=2)
 
-    # Summary of matches
-    matched_count = (submission_df["matched_entity_ids"] != "").sum()
-    singleton_count = (submission_df["matched_entity_ids"] == "").sum()
-    print(f"Predicted Matched Entities : {matched_count:,} ({matched_count/len(all_query_ids)*100:.1f}%)")
-    print(f"Predicted Singletons (Empty): {singleton_count:,} ({singleton_count/len(all_query_ids)*100:.1f}%)")
+    validator = os.path.join("student_resource", "utils", "validate_submission.py")
+    if os.path.exists(validator):
+        log("\n[matching] official validator:")
+        cmd = [sys.executable, validator, "--matching", matching_path, "--candidate", candidate_path,
+               "--test-dir", os.path.join("student_resource", "dataset", "test")]
+        if args.check_ids:
+            cmd.append("--check-ids")
+        subprocess.run(cmd, check=False)
 
-    # Write output file
-    write_submission(submission_df, args.out_file)
-
-    # 6. Validate with official challenge validator
-    validator_path = "student_resource/utils/validate_submission.py"
-    if not os.path.exists(validator_path):
-        validator_path = os.path.join(os.path.dirname(__file__), "..", "student_resource", "utils", "validate_submission.py")
-
-    if os.path.exists(validator_path):
-        print("\nValidating submission against official competition rules...")
-        test_dir = "student_resource/dataset/test"
-        if not os.path.exists(test_dir):
-            test_dir = os.path.join(os.path.dirname(__file__), "..", "student_resource", "dataset", "test")
-        cand_arg = f"--candidate {args.test_candidate_tsv}" if os.path.exists(args.test_candidate_tsv) else ""
-        cmd = f'python "{validator_path}" --matching "{args.out_file}" {cand_arg} --test-dir "{test_dir}"'
-        ret = os.system(cmd)
-        if ret == 0:
-            print("\nSUCCESS: Submission passed all validation checks!")
-        else:
-            print("\nWARNING: Validator reported issues. Check terminal output above.")
-
-    # 7. Optional S3 Upload
     if args.s3_bucket:
         try:
             import boto3
-            print(f"\nUploading artifacts to S3 bucket: {args.s3_bucket}...")
-            s3 = boto3.client("s3")
-            s3.upload_file(args.out_file, args.s3_bucket, f"submissions/{os.path.basename(args.out_file)}")
-            if os.path.exists(args.model_path):
-                s3.upload_file(args.model_path, args.s3_bucket, f"models/{os.path.basename(args.model_path)}")
-            print(f"S3 upload complete! Accessible at s3://{args.s3_bucket}/")
-        except Exception as e:
-            print(f"S3 upload skipped or failed: {e}")
+
+            boto3.client("s3").upload_file(matching_path, args.s3_bucket, "submissions/matching_results.tsv")
+            log(f"[matching] uploaded to s3://{args.s3_bucket}/submissions/")
+        except Exception as exc:  # optional convenience, never fail the run on it
+            log(f"[matching] S3 upload skipped: {exc}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 3 & 4 Matcher Pipeline")
-    parser.add_argument("--mode", choices=["train", "test", "all"], default="all")
+    parser = argparse.ArgumentParser(description="Stages 3-5: matching and submission")
+    parser.add_argument("--mode", choices=["train", "tune", "stack", "test", "all"], default="all")
     parser.add_argument("--preprocessed-dir", default="dataset/preprocessed")
-    parser.add_argument("--train-candidates", default="dataset/candidates/train_candidate_pairs.parquet")
-    parser.add_argument("--val-candidates", default="dataset/candidates/val_candidate_pairs.parquet")
+    parser.add_argument("--train-candidates", default="dataset/candidates/train_full_candidate_pairs.parquet")
     parser.add_argument("--test-candidates", default="dataset/candidates/test_candidate_pairs.parquet")
-    parser.add_argument("--test-candidate-tsv", default="output/candidate_pairs.tsv")
     parser.add_argument("--train-gt", default="student_resource/dataset/train/train_ground_truth.tsv")
     parser.add_argument("--val-gt", default="dataset/val_split/val_ground_truth.tsv")
-    parser.add_argument("--model-path", default="models/lightgbm_matcher.txt")
-    parser.add_argument("--out-file", default="output/matching_results.tsv")
-    parser.add_argument("--threshold", type=float, default=0.72)
-    parser.add_argument("--num-boost-round", type=int, default=300)
-    parser.add_argument("--s3-bucket", default=None, help="Optional S3 bucket name to backup results")
+    parser.add_argument("--model-dir", default="models")
+    parser.add_argument("--output-dir", default="output")
+    parser.add_argument("--train-queries", type=int, default=120_000,
+                        help="S1 entities sampled per fold for training")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-jobs", type=int, default=2, help="worker processes for record normalisation")
+    parser.add_argument("--check-ids", action="store_true", help="validator: also check that every id exists")
+    parser.add_argument("--s3-bucket", default=None, help="optional S3 bucket for a backup of the submission")
     args = parser.parse_args()
 
-    model = None
-    threshold = args.threshold
-
     if args.mode in ("train", "all"):
-        model, threshold = run_train_and_tune(args)
-
+        run_train(args)
+    if args.mode == "tune":
+        run_tune(args)
+    if args.mode == "stack":
+        run_stack(args)
     if args.mode in ("test", "all"):
-        if model is None:
-            if not os.path.exists(args.model_path):
-                sys.exit(f"Error: Model file {args.model_path} not found. Run with --mode train first.")
-            print(f"Loading existing model from {args.model_path}...")
-            model = MatcherModel.load(args.model_path)
-        run_test_inference(args, model, threshold)
+        run_test(args)
 
 
 if __name__ == "__main__":

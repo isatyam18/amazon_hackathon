@@ -55,10 +55,14 @@ def train_matcher(
     X_val: Optional[pd.DataFrame] = None,
     y_val: Optional[np.ndarray] = None,
     params: Optional[Dict] = None,
-    num_boost_round: int = 300,
-    early_stopping_rounds: int = 30,
+    num_boost_round: int = 1000,
+    early_stopping_rounds: int = 50,
 ) -> MatcherModel:
-    """Train a LightGBM model on candidate pair features."""
+    """Train a LightGBM model on candidate pair features.
+
+    Pass an (X_val, y_val) split drawn from the *training* queries for early
+    stopping. Never early-stop on the data used for reporting.
+    """
     feature_names = list(X_train.columns)
 
     default_params = {
@@ -66,11 +70,12 @@ def train_matcher(
         "metric": ["binary_logloss", "auc"],
         "boosting_type": "gbdt",
         "learning_rate": 0.05,
-        "num_leaves": 31,
-        "max_depth": 6,
+        "num_leaves": 63,
+        "min_child_samples": 200,
         "subsample": 0.8,
+        "subsample_freq": 1,          # LightGBM ignores `subsample` unless bagging is enabled
         "colsample_bytree": 0.8,
-        "min_child_samples": 20,
+        "reg_lambda": 1.0,
         "verbosity": -1,
         "n_jobs": -1,
         "random_state": 42,
@@ -91,7 +96,7 @@ def train_matcher(
         valid_names.append("val")
         callbacks.append(lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False))
 
-    callbacks.append(lgb.log_evaluation(period=50))
+    callbacks.append(lgb.log_evaluation(period=100))
 
     booster = lgb.train(
         default_params,

@@ -21,9 +21,12 @@ import scipy.sparse as sp
 from src.blocking.config import BlockingConfig, PassConfig
 
 
-def tfidf_normalize(X: sp.csr_matrix, idf: np.ndarray) -> sp.csr_matrix:
-    """Binary term matrix -> row-L2-normalised TF-IDF (empty rows stay empty)."""
-    Y = X.tocsr(copy=True)
+def tfidf_normalize(X: sp.csr_matrix, idf: np.ndarray, copy: bool = True) -> sp.csr_matrix:
+    """Binary term matrix -> row-L2-normalised TF-IDF (empty rows stay empty).
+
+    With copy=False the matrix's data array is overwritten (saves memory on large indexes).
+    """
+    Y = X.tocsr(copy=copy)
     Y.data = Y.data * idf[Y.indices]
     rows = np.repeat(np.arange(Y.shape[0]), np.diff(Y.indptr))
     norms = np.sqrt(np.bincount(rows, weights=Y.data.astype(np.float64) ** 2, minlength=Y.shape[0]))
@@ -43,18 +46,23 @@ class TargetIndex:
     """Per-pass inverted indexes plus rescoring matrices for one (source, country) partition."""
 
     def __init__(self, view_mats: Dict[str, sp.csr_matrix], config: BlockingConfig):
+        """Build the index. Takes ownership of `view_mats` (the dict is emptied to free memory)."""
         self.config = config
         n = next(iter(view_mats.values())).shape[0] if view_mats else 0
         self.n_targets = n
 
+        # Targets without any address token (their address similarities are uninformative)
+        self.has_address = (np.diff(view_mats["addr_word"].indptr) > 0) if "addr_word" in view_mats else None
+
         self.idf: Dict[str, np.ndarray] = {}
         self.df: Dict[str, np.ndarray] = {}
         normalized: Dict[str, sp.csr_matrix] = {}
-        for view, X in view_mats.items():
+        for view in list(view_mats):
+            X = view_mats.pop(view)  # the index takes ownership: normalised in place, no copy
             df = np.bincount(X.indices, minlength=X.shape[1])
             self.df[view] = df
             self.idf[view] = (np.log((n + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
-            normalized[view] = tfidf_normalize(X, self.idf[view])
+            normalized[view] = tfidf_normalize(X, self.idf[view], copy=False)
 
         self.postings: Dict[str, sp.csr_matrix] = {}
         for p in config.active_passes:
@@ -64,10 +72,9 @@ class TargetIndex:
                 block.data *= np.float32(np.sqrt(weight))
                 blocks.append(block)
             T = sp.hstack(blocks, format="csr") if len(blocks) > 1 else blocks[0]
+            del blocks
             self.postings[p.name] = T.T.tocsr()
-
-        # Targets without any address token (their address similarities are uninformative)
-        self.has_address = (np.diff(view_mats["addr_word"].indptr) > 0) if "addr_word" in view_mats else None
+            del T
 
         # Full (unpruned) normalised target rows for exact pair rescoring
         self.rescore: Dict[str, sp.csr_matrix] = {v: normalized[v] for v in config.rescore_weights}

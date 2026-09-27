@@ -25,7 +25,13 @@ student_resource/dataset/
 *.mp4
 
 # Model weights and artifacts
-models/
+models/*
+!models/matcher_fold0.txt
+!models/matcher_fold1.txt
+!models/stack_fold0.txt
+!models/stack_fold1.txt
+!models/matching_config.json
+
 *.pth
 *.pt
 *.bin

@@ -128,3 +128,38 @@ def find_optimal_threshold(
             best_threshold = float(t)
 
     return best_threshold, best_score, scores_by_threshold
+
+
+# --- Vectorised exact metric (same definition as compute_entity_f05) ---------------------------
+
+def per_query_f05(
+    n_queries: int,
+    pred_q: np.ndarray,
+    pred_key: np.ndarray,
+    true_q: np.ndarray,
+    true_key: np.ndarray,
+    beta: float = 0.5,
+) -> np.ndarray:
+    """Per-query F_beta for integer-encoded predictions and ground truth.
+
+    Queries are 0..n_queries-1. `pred_key` / `true_key` are integer pair keys
+    (e.g. query << 32 | target) and must use the same encoding. Every query
+    counts, including those without predictions or truth:
+      no truth & no prediction -> 1.0, no truth & any prediction -> 0.0,
+      truth & no correct prediction -> 0.0, else (1+b^2) P R / (b^2 P + R).
+    """
+    n_true = np.bincount(true_q, minlength=n_queries).astype(np.float64)
+    n_pred = np.bincount(pred_q, minlength=n_queries).astype(np.float64)
+    hit = np.isin(pred_key, true_key)
+    n_hit = np.bincount(pred_q[hit], minlength=n_queries).astype(np.float64)
+    b2 = beta * beta
+    with np.errstate(divide="ignore", invalid="ignore"):
+        precision = np.where(n_pred > 0, n_hit / n_pred, 0.0)
+        recall = np.where(n_true > 0, n_hit / n_true, 0.0)
+        f = np.where(n_hit > 0, (1 + b2) * precision * recall / (b2 * precision + recall), 0.0)
+    return np.where(n_true == 0, (n_pred == 0).astype(np.float64), f)
+
+
+def macro_f05_arrays(n_queries, pred_q, pred_key, true_q, true_key) -> float:
+    """Macro F0.5 over all n_queries (the leaderboard metric)."""
+    return float(per_query_f05(n_queries, pred_q, pred_key, true_q, true_key).mean()) if n_queries else 1.0
