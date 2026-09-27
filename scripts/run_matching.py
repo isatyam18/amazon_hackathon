@@ -47,6 +47,7 @@ from src.matching.workflow import (
     Universe,
     default_rule_grid,
     evaluate,
+    orphan_drop_fraction,
     predict_and_write,
     query_folds,
     select_all,
@@ -73,7 +74,7 @@ def fmt(report: dict) -> str:
 
 def tune_and_report(args, universe: Universe, folds: np.ndarray, results) -> dict:
     """Calibration + rule on fold 0, honest report on fold 1."""
-    tune_mask, report_mask = folds == 0, folds == 1
+    tune_mask, report_mask = (folds == 0) & universe.active, (folds == 1) & universe.active
     labels = [r.labels() for r in results]
     fold0 = [tune_mask[r.q] for r in results]
     calibrator = Calibrator().fit(np.concatenate([r.prob[m] for r, m in zip(results, fold0)]),
@@ -109,12 +110,21 @@ def tune_and_report(args, universe: Universe, folds: np.ndarray, results) -> dic
             "missing_mass": missing_mass, "report": report}
 
 
+def drop_fraction_for(args) -> float:
+    if args.no_orphan_sim:
+        return 0.0
+    return orphan_drop_fraction(args.preprocessed_dir)
+
+
 def run_train(args) -> None:
     log("=" * 70 + "\nSTAGES 3-4: OUT-OF-FOLD TRAINING, DECISION TUNING, EVALUATION\n" + "=" * 70)
+    drop = drop_fraction_for(args)
     models, universe, folds, results = train_oof(
         args.train_candidates, args.preprocessed_dir, load_ground_truth(args.train_gt), "train",
         n_train_queries=args.train_queries, seed=args.seed, n_jobs=args.n_jobs,
         results_dir=os.path.join(args.model_dir, "oof"), log=log,
+        drop_fraction=drop, num_boost_round=args.num_boost_round,
+        cache_root=None if args.no_feature_cache else args.feature_cache,
     )
     importances = models[0].get_feature_importances()
     log("\nTop features (gain, fold-0 model):\n" + importances.head(25).to_string(index=False))
@@ -126,6 +136,9 @@ def run_train(args) -> None:
         "models": [f"matcher_fold{i}.txt" for i in range(len(models))],
         "feature_names": models[0].feature_names,
         "feature_importance": importances.to_dict(orient="records"),
+        "universe_drop_fraction": drop,
+        # features the models were trained on: float16 from the feature cache, float32 when computed live
+        "feature_precision": "float32" if args.no_feature_cache else "float16",
     }
     config.update(tune_and_report(args, universe, folds, results))
     with open(os.path.join(args.model_dir, "matching_config.json"), "w", encoding="utf-8") as fh:
@@ -135,13 +148,14 @@ def run_train(args) -> None:
 
 def run_tune(args) -> None:
     log("=" * 70 + "\nSTAGE 4: DECISION TUNING FROM SAVED OOF ARRAYS\n" + "=" * 70)
-    universe = Universe.load(args.preprocessed_dir, "train")
+    config_path = os.path.join(args.model_dir, "matching_config.json")
+    config = json.load(open(config_path, encoding="utf-8")) if os.path.exists(config_path) else {}
+    # Same universe the OOF arrays were produced on (test-like orphan simulation, if used)
+    universe = Universe.load(args.preprocessed_dir, "train", drop_fraction=config.get("universe_drop_fraction", 0.0))
     folds = query_folds(universe.s1_ids)
     results = [PartitionResult.load(p) for p in sorted(glob.glob(os.path.join(args.model_dir, "oof", "oof_*.npz")))]
     if not results:
         sys.exit("No OOF arrays in models/oof/. Run --mode train first.")
-    config_path = os.path.join(args.model_dir, "matching_config.json")
-    config = json.load(open(config_path, encoding="utf-8")) if os.path.exists(config_path) else {}
     config.update(tune_and_report(args, universe, folds, results))
     with open(config_path, "w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2)
@@ -152,14 +166,31 @@ def run_stack(args) -> None:
     from src.matching.stacking import train_stack
 
     log("=" * 70 + "\nSTAGE 4b: SECOND-STAGE (STACKED) MODEL ON OOF PROBABILITIES\n" + "=" * 70)
-    universe = Universe.load(args.preprocessed_dir, "train")
-    folds = query_folds(universe.s1_ids)
-    results = [PartitionResult.load(p) for p in sorted(glob.glob(os.path.join(args.model_dir, "oof", "oof_*.npz")))]
     config_path = os.path.join(args.model_dir, "matching_config.json")
     config = json.load(open(config_path, encoding="utf-8"))
+    universe = Universe.load(args.preprocessed_dir, "train", drop_fraction=config.get("universe_drop_fraction", 0.0))
+    folds = query_folds(universe.s1_ids)
+    results = [PartitionResult.load(p) for p in sorted(glob.glob(os.path.join(args.model_dir, "oof", "oof_*.npz")))]
     first_stage = config["report"]["fold0_tuning"]["macro_f05"]
 
-    models, stacked = train_stack(results, folds, log=log)
+    extras = None
+    if args.stack_support:
+        from src.matching.stacking import support_features
+        from src.matching.workflow import CandidateGraph, Partition, release_memory
+
+        extras = []
+        for r in results:
+            graph = CandidateGraph.load(args.train_candidates, universe, r.country)
+            if len(graph) != len(r.q) or not np.array_equal(graph.q, r.q):
+                sys.exit(f"{r.country}: candidate graph does not match the saved OOF arrays; rerun --mode train")
+            part = Partition.build(graph, args.preprocessed_dir, "train", args.n_jobs)
+            store = part.store
+            extras.append(support_features(r.q, r.prob, part.t_local, store))
+            log(f"[stacking] {r.country}: support features for {len(r.q):,} pairs")
+            del graph, part, store
+            release_memory()
+
+    models, stacked = train_stack(results, folds, log=log, extras=extras)
     for r, p in zip(results, stacked):
         r.prob = p
     outcome = tune_and_report(args, universe, folds, results)
@@ -168,9 +199,10 @@ def run_stack(args) -> None:
     if second_stage > first_stage:
         for i, m in enumerate(models):
             m.save(os.path.join(args.model_dir, f"stack_fold{i}.txt"))
-        config["first_stage_report"] = config["report"]
+        config["previous_report"] = config["report"]
         config.update(outcome)
         config["stack_models"] = [f"stack_fold{i}.txt" for i in range(len(models))]
+        config["stack_support"] = bool(args.stack_support)
         with open(config_path, "w", encoding="utf-8") as fh:
             json.dump(config, fh, indent=2)
         log(f"[stacking] adopted: {config_path} updated")
@@ -192,7 +224,10 @@ def run_test(args) -> None:
     candidate_path = os.path.join(args.output_dir, "candidate_pairs.tsv")
     stats = predict_and_write(args.test_candidates, args.preprocessed_dir, "test", models, calibrator, rule,
                               matching_path, candidate_path, n_jobs=args.n_jobs, log=log,
-                              stack_models=stack_models)
+                              stack_models=stack_models,
+                              cache_root=None if args.no_feature_cache else args.feature_cache,
+                              precision=config.get("feature_precision", "float32"),
+                              stack_support=config.get("stack_support", False))
     log(f"[matching] wrote {matching_path} and {candidate_path}: {json.dumps(stats)}")
     with open(os.path.join(args.model_dir, "test_prediction_stats.json"), "w", encoding="utf-8") as fh:
         json.dump(stats, fh, indent=2)
@@ -226,8 +261,20 @@ def main():
     parser.add_argument("--val-gt", default="dataset/val_split/val_ground_truth.tsv")
     parser.add_argument("--model-dir", default="models")
     parser.add_argument("--output-dir", default="output")
-    parser.add_argument("--train-queries", type=int, default=120_000,
+    parser.add_argument("--train-queries", type=int, default=200_000,
                         help="S1 entities sampled per fold for training")
+    parser.add_argument("--num-boost-round", type=int, default=3000,
+                        help="maximum LightGBM rounds (early stopping decides)")
+    parser.add_argument("--stack-support", action="store_true",
+                        help="stack mode: add support features (overlap with the S1's other confident candidates)")
+    parser.add_argument("--feature-cache", default="dataset/feature_cache",
+                        help="directory for cached record-based pair features (built once per split/country)")
+    parser.add_argument("--no-feature-cache", action="store_true",
+                        help="always compute pair features live (no disk cache)")
+    parser.add_argument("--no-orphan-sim", action="store_true",
+                        help="train/evaluate on all train S1 instead of the test-like universe "
+                             "(by default ~19%% of train S1 are dropped so their records become orphans, "
+                             "matching test's records-per-S1 ratio)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-jobs", type=int, default=2, help="worker processes for record normalisation")
     parser.add_argument("--check-ids", action="store_true", help="validator: also check that every id exists")

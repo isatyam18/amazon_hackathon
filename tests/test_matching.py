@@ -204,6 +204,35 @@ def test_end_to_end_outputs_pass_validator(tmp_path):
     assert all(m[q] <= c[q] for q in m)                      # matches are a subset of candidates
     assert m["S1-99"] == set() and c["S1-99"] == set()        # no candidates -> empty rows in both files
 
+    # Feature cache: exact at the models' precision, records never rebuilt, write-through while scoring
+    from src.matching.workflow import partition_cache
+    country = candidate_countries(str(parquet))[0]
+    graph = CandidateGraph.load(str(parquet), universe, country)
+    idx_all = np.arange(len(graph))
+    live32 = Partition.build(graph, str(pre_dir), "toy", n_jobs=1).features(idx_all)
+    live16 = Partition.build(graph, str(pre_dir), "toy", n_jobs=1, precision="float16").features(idx_all)
+    cache = partition_cache(str(tmp_path / "cache"), str(parquet), str(pre_dir), "toy", graph)
+    assert not cache.complete
+    Partition.build(graph, str(pre_dir), "toy", n_jobs=1, cache=cache).ensure_cache(log=lambda *_: None)
+    assert cache.complete
+    cached_part = Partition.build(graph, str(pre_dir), "toy", n_jobs=1, cache=cache, precision="float16")
+    cached = cached_part.features(idx_all)
+    assert cached_part._store is None                          # served from disk
+    assert list(cached.columns) == list(live32.columns)
+    np.testing.assert_array_equal(cached.to_numpy(), live16.to_numpy())   # bit-identical to training input
+    # float32 models ignore the float16 cache and are scored on exact live values
+    exact = Partition.build(graph, str(pre_dir), "toy", n_jobs=1, cache=cache).features(idx_all)
+    np.testing.assert_array_equal(exact.to_numpy(), live32.to_numpy())
+
+    class Constant:
+        def predict_proba(self, X):
+            return np.full(len(X), 0.5)
+
+    cache2 = partition_cache(str(tmp_path / "cache2"), str(parquet), str(pre_dir), "toy", graph)
+    Partition.build(graph, str(pre_dir), "toy", n_jobs=1, cache=cache2).score(
+        lambda idx: [(np.ones(len(idx), bool), [Constant()])], chunk=7, log=lambda *_: None)
+    assert cache2.complete                                     # filled while scoring
+
 
 def test_stacking_learns_competition_and_stays_out_of_fold():
     from src.matching.stacking import apply_stack, prob_context_features, train_stack
@@ -226,3 +255,20 @@ def test_stacking_learns_competition_and_stays_out_of_fold():
     from sklearn.metrics import roc_auc_score
     assert roc_auc_score(label, stacked[0]) >= roc_auc_score(label, p) - 0.01  # context never hurts much
     assert apply_stack(models, res.q, res.t, res.prob).shape == (len(q),)
+
+
+def test_support_features_reward_agreement_with_confident_candidates():
+    from src.matching.stacking import support_features
+
+    raw = pd.DataFrame([
+        ["S2-1", "Supreme Interiors Inc", "9122 Duane Street, Houston, TX", "US"],   # confident true match
+        ["S2-2", "Tavowex", "9122 DUANE ST, HOUSTON, TX", "US"],                     # random DBA name, same address
+        ["S3-1", "Supreme Interiors", "77 Elm St, Dayton, OH", "US"],                # namesake elsewhere
+    ], columns=["entity_id", "business_name", "business_address", "country"])
+    store = RecordStore(preprocess_dataframe(raw), n_jobs=1)
+    q = np.array([0, 0, 0])
+    p = np.array([0.95, 0.3, 0.3], np.float32)
+    f = support_features(q, p, np.array([0, 1, 2]), store, k=5)
+    assert f.loc[1, "sup_addr_pmax"] > 0.8 and f.loc[2, "sup_addr_pmax"] < 0.3
+    assert f.loc[2, "sup_name_max"] > f.loc[1, "sup_name_max"]
+    assert f.loc[1, "sup_addr_top"] == f.loc[1, "sup_addr_max"]  # top anchor of row 1 is row 0

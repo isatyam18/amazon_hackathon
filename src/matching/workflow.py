@@ -36,7 +36,8 @@ import pandas as pd
 from src.blocking.data import ground_truth_pairs, load_source
 from src.matching.context import context_features
 from src.matching.decision import Calibrator, DecisionRule, apply_rule
-from src.matching.features import BLOCKING_COLUMNS, pair_features
+from src.matching.cache import FeatureCache, fingerprint
+from src.matching.features import BLOCKING_COLUMNS, feature_names, pair_features
 from src.matching.model import MatcherModel, train_matcher
 from src.matching.records import RecordStore
 from src.matching.threshold import per_query_f05
@@ -70,15 +71,55 @@ def candidate_countries(candidates_path: str) -> List[str]:
 
 # --- Universe (all S1 entities of a split) ---------------------------------------------
 
+def orphan_drop_fraction(preprocessed_dir: str, train_split: str = "train", test_split: str = "test") -> float:
+    """Fraction of train S1 entities to drop so train has test's records-per-S1 ratio.
+
+    Test has more S2/S3 records per S1 entity than train, so more of its records
+    are orphans (belong to no S1). Dropping S1 entities (their records stay)
+    reproduces that ratio. Computed from file row counts, nothing hard-coded.
+    """
+    from src.blocking.data import preprocessed_path
+    import pyarrow.parquet as pq
+
+    def rows(split, source):
+        path = preprocessed_path(preprocessed_dir, split, source)
+        if path.endswith(".parquet"):
+            return pq.ParquetFile(path).metadata.num_rows
+        with open(path, encoding="utf-8") as fh:
+            return sum(1 for _ in fh) - 1
+
+    ratio_train = (rows(train_split, 2) + rows(train_split, 3)) / rows(train_split, 1)
+    ratio_test = (rows(test_split, 2) + rows(test_split, 3)) / rows(test_split, 1)
+    return float(max(0.0, 1.0 - ratio_train / ratio_test))
+
+
+
 @dataclass
 class Universe:
     s1_ids: np.ndarray       # every S1 entity of the split, in file order
     s1_country: np.ndarray   # its country label
+    active: Optional[np.ndarray] = None  # S1 entities kept in the universe (None = all)
+
+    def __post_init__(self):
+        if self.active is None:
+            self.active = np.ones(len(self.s1_ids), bool)
 
     @classmethod
-    def load(cls, preprocessed_dir: str, split: str) -> "Universe":
+    def load(cls, preprocessed_dir: str, split: str, drop_fraction: float = 0.0,
+             drop_seed: int = 2026) -> "Universe":
+        """All S1 entities of a split, optionally with a random `drop_fraction` removed.
+
+        Dropping S1 entities turns their S2/S3 records into orphans (records that
+        belong to no S1 entity), used to reproduce the test set's higher orphan rate
+        (see orphan_drop_fraction).
+        """
         s1 = load_source(preprocessed_dir, split, 1, columns=["entity_id", "country"])
-        return cls(s1["entity_id"].to_numpy(object), s1["country"].to_numpy(object))
+        ids = s1["entity_id"].to_numpy(object)
+        active = None
+        if drop_fraction > 0:
+            u = (pd.util.hash_array(ids, hash_key="orphans" + str(drop_seed).rjust(9, "0")) % np.uint64(10**6)) / 1e6
+            active = u >= drop_fraction
+        return cls(ids, s1["country"].to_numpy(object), active)
 
     def __len__(self) -> int:
         return len(self.s1_ids)
@@ -125,10 +166,15 @@ class CandidateGraph:
         t_ids, t_codes = codes("candidate_entity_id")
         blocking = {c: table.column(c).to_numpy().astype(np.float16) for c in cols[2:]}
         del table
-        src = (pd.Series(t_ids, dtype=object).str.slice(0, 2).to_numpy() == "S3").astype(np.int8)
-        graph = cls(country=country, universe=universe, t_ids=t_ids, q=q_rows[q_codes].astype(np.int32),
-                    t=t_codes, src=src[t_codes], blocking=blocking)
+        q = q_rows[q_codes].astype(np.int32)
         del q_codes
+        keep = universe.active[q]
+        if not keep.all():  # dropped S1 entities vanish; their records remain as orphans
+            q, t_codes = q[keep], t_codes[keep]
+            blocking = {c: v[keep] for c, v in blocking.items()}
+        src = (pd.Series(t_ids, dtype=object).str.slice(0, 2).to_numpy() == "S3").astype(np.int8)
+        graph = cls(country=country, universe=universe, t_ids=t_ids, q=q,
+                    t=t_codes, src=src[t_codes], blocking=blocking)
         release_memory()
         ctx = context_features(graph.q, graph.t, graph.src, graph.blocking["candidate_score"],
                                graph.blocking["sim_name_char"])
@@ -138,59 +184,123 @@ class CandidateGraph:
         return graph
 
     def query_rows(self) -> np.ndarray:
-        """Universe rows of the S1 entities labelled with this partition's country."""
-        return np.flatnonzero(self.universe.s1_country == self.country)
+        """Universe rows of the active S1 entities labelled with this partition's country."""
+        return np.flatnonzero((self.universe.s1_country == self.country) & self.universe.active)
 
 
 @dataclass
 class Partition:
-    """Records of one country partition plus the local store rows of its pairs."""
+    """One country partition: its graph plus lazily built records and an optional feature cache.
+
+    The RecordStore (record strings / token matrices) is built only when a feature
+    has to be computed, so a run whose features are all cached never builds it.
+    """
     graph: CandidateGraph
-    store: RecordStore
-    q_local: np.ndarray
-    t_local: np.ndarray
+    preprocessed_dir: str
+    split: str
+    n_jobs: int = 2
+    cache: Optional[FeatureCache] = None
+    precision: str = "float32"  # feature precision the scoring models were trained on
+    _store: Optional[RecordStore] = None
+    q_local: Optional[np.ndarray] = None
+    t_local: Optional[np.ndarray] = None
 
     @classmethod
-    def build(cls, graph: CandidateGraph, preprocessed_dir: str, split: str, n_jobs: int = 2) -> "Partition":
-        uq, q_inv = np.unique(graph.q, return_inverse=True)
-        ut, t_inv = np.unique(graph.t, return_inverse=True)
-        frames = []
-        for source, ids in ((1, graph.universe.s1_ids[uq]), (2, graph.t_ids[ut]), (3, graph.t_ids[ut])):
-            df = load_source(preprocessed_dir, split, source)
-            frames.append(df[df["entity_id"].isin(pd.Index(ids))])
-            del df
-        frame = pd.concat(frames, ignore_index=True)
-        del frames
-        release_memory()
-        store = RecordStore(frame, n_jobs=n_jobs)
-        del frame
-        q_local = store.rows(graph.universe.s1_ids[uq])[q_inv]
-        t_local = store.rows(graph.t_ids[ut])[t_inv]
-        release_memory()
-        return cls(graph, store, q_local, t_local)
+    def build(cls, graph: CandidateGraph, preprocessed_dir: str, split: str, n_jobs: int = 2,
+              cache: Optional[FeatureCache] = None, precision: str = "float32") -> "Partition":
+        if precision not in ("float32", "float16"):
+            raise ValueError(f"unknown feature precision {precision!r}")
+        return cls(graph, preprocessed_dir, split, n_jobs, cache, precision)
 
-    def features(self, idx: np.ndarray) -> pd.DataFrame:
+    @property
+    def store(self) -> RecordStore:
+        if self._store is None:
+            graph = self.graph
+            uq, q_inv = np.unique(graph.q, return_inverse=True)
+            ut, t_inv = np.unique(graph.t, return_inverse=True)
+            frames = []
+            for source, ids in ((1, graph.universe.s1_ids[uq]), (2, graph.t_ids[ut]), (3, graph.t_ids[ut])):
+                df = load_source(self.preprocessed_dir, self.split, source)
+                frames.append(df[df["entity_id"].isin(pd.Index(ids))])
+                del df
+            frame = pd.concat(frames, ignore_index=True)
+            del frames
+            release_memory()
+            self._store = RecordStore(frame, n_jobs=self.n_jobs)
+            del frame
+            self.q_local = self._store.rows(graph.universe.s1_ids[uq])[q_inv]
+            self.t_local = self._store.rows(graph.t_ids[ut])[t_inv]
+            release_memory()
+        return self._store
+
+    def _live_features(self, idx: np.ndarray) -> pd.DataFrame:
+        store = self.store
+        return pair_features(store, self.q_local[idx], self.t_local[idx])
+
+    def _at_precision(self, base: pd.DataFrame) -> pd.DataFrame:
+        """Round live features exactly as the cache stores them when the models were trained on float16."""
+        if self.precision == "float16":
+            for c in base.columns:
+                base[c] = base[c].to_numpy(np.float32).astype(np.float16).astype(np.float32)
+        return base
+
+    def _base_features(self, idx: np.ndarray) -> pd.DataFrame:
+        """Record-based pair features at the models' training precision (from the cache when valid)."""
+        if self.precision == "float16" and self.cache is not None and self.cache.complete:
+            return self.cache.load(idx)
+        return self._at_precision(self._live_features(idx))
+
+    def ensure_cache(self, log: Callable = print) -> None:
+        """Compute and store the record-based features of every pair once (no-op when cached)."""
+        if self.cache is None or self.cache.complete:
+            return
+        store = self.store
+        self.cache.build(len(self.graph), lambda idx: pair_features(store, self.q_local[idx], self.t_local[idx]),
+                         log=log, label=f"{self.split}/{self.graph.country}")
+
+    def features(self, idx: np.ndarray, base: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """Feature frame for pair positions `idx` of the partition graph."""
         g = self.graph
-        extra = {k: v[idx] for k, v in g.blocking.items()}
-        extra.update({k: v[idx] for k, v in g.context.items()})
-        extra["is_s2"] = (g.src[idx] == 0).astype(np.float32)
-        return pair_features(self.store, self.q_local[idx], self.t_local[idx], extra)
+        frame = self._base_features(idx) if base is None else base
+        for k, v in g.blocking.items():
+            frame[k] = np.asarray(v[idx], dtype=np.float32)
+        for k, v in g.context.items():
+            frame[k] = np.asarray(v[idx], dtype=np.float32)
+        frame["is_s2"] = (g.src[idx] == 0).astype(np.float32)
+        return frame
 
     def score(self, models_for: Callable, chunk: int = 2_000_000, log: Callable = print) -> np.ndarray:
         """Probabilities for every pair; `models_for(idx)` -> list of (mask over idx, models to average)."""
         n = len(self.graph)
         out = np.empty(n, np.float32)
+        # Write-through: when the cache is missing, the live features computed for scoring fill it too
+        writer = self.cache.writer(n) if self.cache is not None and not self.cache.complete else None
         t0 = time.time()
         for a in range(0, n, chunk):
             idx = np.arange(a, min(a + chunk, n))
-            X = self.features(idx)
+            base = None
+            if writer is not None:
+                base = self._live_features(idx)
+                writer.write(idx, base)
+                base = self._at_precision(base)
+            X = self.features(idx, base)
             for mask, models in models_for(idx):
                 if mask.any():
                     out[idx[mask]] = np.mean([m.predict_proba(X[mask]) for m in models], axis=0)
-            del X
+            del X, base
             log(f"[matching]   {self.graph.country}: scored {idx[-1] + 1:,}/{n:,} pairs ({time.time() - t0:.0f}s)")
+        if writer is not None:
+            writer.publish()
         return out
+
+
+def partition_cache(cache_root: Optional[str], candidates_path: str, preprocessed_dir: str, split: str,
+                    graph: CandidateGraph, drop_fraction: float = 0.0) -> Optional[FeatureCache]:
+    """Feature cache for a partition graph, or None when caching is disabled."""
+    if not cache_root:
+        return None
+    key = fingerprint(candidates_path, preprocessed_dir, split, graph.country, drop_fraction)
+    return FeatureCache(cache_root, split, graph.country, key, feature_names([]))
 
 
 # --- Ground truth and per-partition results ------------------------------------------------
@@ -199,7 +309,7 @@ def truth_for(graph: CandidateGraph, gt_pairs: pd.DataFrame) -> Tuple[np.ndarray
     """(query rows, pair keys) of the true pairs of the partition's S1 entities."""
     q = pd.Index(graph.universe.s1_ids).get_indexer(pd.Index(gt_pairs["source1_entity_id"]))
     keep = q >= 0
-    keep[keep] = graph.universe.s1_country[q[keep]] == graph.country
+    keep[keep] = (graph.universe.s1_country[q[keep]] == graph.country) & graph.universe.active[q[keep]]
     q = q[keep].astype(np.int64)
     t = pd.Index(graph.t_ids).get_indexer(pd.Index(gt_pairs["candidate_entity_id"].to_numpy()[keep])).astype(np.int64)
     t[t < 0] = NO_TARGET
@@ -302,7 +412,7 @@ def sample_roles(universe: Universe, folds: np.ndarray, n_train_queries: int, es
     rng = np.random.default_rng(seed)
     role = np.zeros(len(universe), np.int8)
     for f in (0, 1):
-        pool = np.flatnonzero(folds == f)
+        pool = np.flatnonzero((folds == f) & universe.active)
         sample = rng.choice(pool, size=min(n_train_queries, len(pool)), replace=False)
         n_es = max(1, int(len(sample) * es_fraction))
         role[sample[:n_es]] = 2
@@ -322,12 +432,20 @@ def train_oof(
     n_jobs: int = 2,
     results_dir: Optional[str] = None,
     log: Callable = print,
+    drop_fraction: float = 0.0,
+    num_boost_round: int = 1000,
+    cache_root: Optional[str] = None,
 ):
     """Train one model per fold, then score every pair out-of-fold, one country at a time.
 
     Returns (models, universe, folds, [PartitionResult per country]).
     """
-    universe = Universe.load(preprocessed_dir, split)
+    # With a feature cache the models are trained (and later scored) on its float16 values
+    precision = "float16" if cache_root else "float32"
+    universe = Universe.load(preprocessed_dir, split, drop_fraction=drop_fraction)
+    if drop_fraction > 0:
+        log(f"[matching] test-like universe: {int((~universe.active).sum()):,} of {len(universe):,} S1 "
+            f"entities dropped ({drop_fraction:.1%}); their records become orphans")
     folds = query_folds(universe.s1_ids)
     role = sample_roles(universe, folds, n_train_queries, es_fraction, seed)
     gt_pairs = ground_truth_pairs(gt)
@@ -340,7 +458,10 @@ def train_oof(
         graph = CandidateGraph.load(candidates_path, universe, country)
         tq, tkey = truth_for(graph, gt_pairs)
         labels = np.isin(pair_key(graph.q, graph.t), tkey)
-        part = Partition.build(graph, preprocessed_dir, split, n_jobs)
+        part = Partition.build(graph, preprocessed_dir, split, n_jobs,
+                               partition_cache(cache_root, candidates_path, preprocessed_dir, split, graph,
+                                               drop_fraction), precision)
+        part.ensure_cache(log)  # all pairs once; later passes and runs read the cache
         idx = np.flatnonzero(role[graph.q] > 0)
         X = part.features(idx)
         pair_fold, pair_role = folds[graph.q[idx]], role[graph.q[idx]]
@@ -360,7 +481,8 @@ def train_oof(
         X_es, y_es = pd.concat(samples.pop((f, 2)), ignore_index=True), np.concatenate(sample_y.pop((f, 2)))
         log(f"[matching] fold {f}: training on {len(X_tr):,} pairs ({y_tr.mean():.2%} positive), "
             f"early stopping on {len(X_es):,}")
-        model = train_matcher(X_tr, y_tr.astype(int), X_es, y_es.astype(int), params=params)
+        model = train_matcher(X_tr, y_tr.astype(int), X_es, y_es.astype(int), params=params,
+                              num_boost_round=num_boost_round)
         log(f"[matching] fold {f}: {model.booster.best_iteration or model.booster.current_iteration()} trees")
         models.append(model)
         del X_tr, X_es
@@ -370,7 +492,9 @@ def train_oof(
     for country in countries:
         graph = CandidateGraph.load(candidates_path, universe, country)
         tq, tkey = truth_for(graph, gt_pairs)
-        part = Partition.build(graph, preprocessed_dir, split, n_jobs)
+        part = Partition.build(graph, preprocessed_dir, split, n_jobs,
+                               partition_cache(cache_root, candidates_path, preprocessed_dir, split, graph,
+                                               drop_fraction), precision)
         fold_of = folds[graph.q]
         log(f"[matching] OOF scoring {country}: fold-1 model on fold 0, fold-0 model on fold 1")
         prob = part.score(lambda idx: [(fold_of[idx] == 0, [models[1]]), (fold_of[idx] == 1, [models[0]])], log=log)
@@ -453,6 +577,9 @@ def predict_and_write(
     n_jobs: int = 2,
     log: Callable = print,
     stack_models: Optional[List[MatcherModel]] = None,
+    cache_root: Optional[str] = None,
+    precision: str = "float32",
+    stack_support: bool = False,
 ) -> Dict:
     """Score every candidate pair (country by country) and write both submission files.
 
@@ -471,12 +598,18 @@ def predict_and_write(
         fc.write("source1_entity_id\tcandidate_entity_ids\n")
         for country in candidate_countries(candidates_path):
             graph = CandidateGraph.load(candidates_path, universe, country)
-            part = Partition.build(graph, preprocessed_dir, split, n_jobs)
+            part = Partition.build(graph, preprocessed_dir, split, n_jobs,
+                                   partition_cache(cache_root, candidates_path, preprocessed_dir, split, graph),
+                                   precision)
             prob = part.score(lambda idx: [(np.ones(len(idx), bool), models)], log=log)
             if stack_models:
-                from src.matching.stacking import apply_stack
+                from src.matching.stacking import apply_stack, support_features
 
-                prob = apply_stack(stack_models, graph.q, graph.t, prob)
+                extra = None
+                if stack_support:
+                    store = part.store  # records + token matrices (also sets part.t_local)
+                    extra = support_features(graph.q, prob, part.t_local, store)
+                prob = apply_stack(stack_models, graph.q, graph.t, prob, extra)
             prob = calibrator.transform(prob)
             selected = apply_rule(rule, graph.q, graph.t, prob)
             rows = np.unique(graph.q)
