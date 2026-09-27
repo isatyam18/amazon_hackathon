@@ -19,12 +19,14 @@ class MatcherModel:
         self.booster = booster
         self.feature_names = feature_names or []
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X) -> np.ndarray:
         """Predict match probabilities (values between 0.0 and 1.0)."""
         if self.booster is None:
             raise ValueError("Model is not trained or loaded yet.")
-        if self.feature_names:
-            X = X[self.feature_names]
+        if isinstance(X, pd.DataFrame) and self.feature_names:
+            cols = [c for c in self.feature_names if c in X.columns]
+            if len(cols) == len(self.feature_names):
+                X = X[self.feature_names]
         return self.booster.predict(X)
 
     def save(self, model_path: str) -> None:
